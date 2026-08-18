@@ -1,0 +1,27 @@
+# 가상환경 — 플랫폼과 CUDA 버전에 종속되므로 절대 공유하면 안 된다.
+# 서버에서는 그쪽 CUDA에 맞는 torch를 새로 설치해야 한다.
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 원본 샤드 12GB. codeparrot-clean에서 다시 받는 편이 업로드보다 빠르다.
+#   python data/download.py --shards 54
+data/raw/
+
+# 필터·토큰화 산출물 35GB+. data/prepare.py로 재생성한다.
+data/processed/
+
+# 체크포인트는 개당 612MB. 학습 결과물이라 git에 넣을 것이 아니다.
+# 필요하면 릴리스나 별도 저장소로 옮길 것.
+checkpoints/*
+!checkpoints/.gitkeep
+
+# 실행 로그
+*.log
+eval/results*.json
+
+# tokenizer.json은 무시하지 않는다. 어휘 16,384가 모델 임베딩 크기와
+# 묶여 있어서, 다른 기계에서 다시 학습하면 체크포인트가 호환되지 않는다.
+# finetune/data/*.jsonl도 올린다(2MB). 코퍼스 없이 SFT를 바로 시험할 수 있다.
