@@ -12,6 +12,7 @@ SUITES = [
     ("1단계 토크나이저", ROOT / "tests" / "test_tokenizer.py"),
     ("2단계 모델", ROOT / "tests" / "test_model.py"),
     ("3단계 학습 루프", ROOT / "tests" / "test_training.py"),
+    ("3단계 DDP", ROOT / "tests" / "test_ddp.py"),
     ("평가 하네스", ROOT / "tests" / "test_eval.py"),
     ("SFT 파이프라인", ROOT / "tests" / "test_sft.py"),
     ("검색/툴 레이어", ROOT / "tests" / "test_tools.py"),

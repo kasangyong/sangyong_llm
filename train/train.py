@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -21,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model.transformer import ModelConfig, Transformer
 
@@ -40,7 +44,10 @@ class TrainConfig:
     # 처리량도 가장 높다. batch 6은 6.30GB로 시스템 RAM에 유출된다.
     batch_size: int = 4
     grad_accum: int = 32
-    block_size: int = 1024
+    block_size: int = 2048  # ModelConfig.max_seq_len과 반드시 같아야 한다
+    # torchrun이 띄운 프로세스 수. train()에서 실측값으로 덮어쓴다.
+    # 유효 배치와 스텝 수 계산에 들어가야 GPU 수를 바꿔도 같은 분량을 학습한다.
+    world_size: int = 1
 
     lr: float = 6e-4
     min_lr_frac: float = 0.1  # 최종 lr = lr * min_lr_frac
@@ -70,7 +77,8 @@ class TrainConfig:
 
     @property
     def tokens_per_iter(self) -> int:
-        return self.batch_size * self.grad_accum * self.block_size
+        """한 옵티마이저 스텝이 소비하는 전체 토큰 수(모든 랭크 합산)."""
+        return self.batch_size * self.grad_accum * self.block_size * self.world_size
 
 
 def lr_at(it: int, cfg: TrainConfig) -> float:
@@ -168,7 +176,9 @@ def estimate_loss(model, datasets, cfg, device, generator=None):
         losses = torch.zeros(cfg.eval_iters)
         for i in range(cfg.eval_iters):
             x, y = ds.batch(cfg.batch_size, device, generator)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+            ):
                 _, loss, _ = model(x, targets=y)
             losses[i] = loss.item()
         out[split] = losses.mean().item()
@@ -201,15 +211,58 @@ def load_checkpoint(path: Path, device):
     return model, ck
 
 
+@dataclass
+class DDPContext:
+    """분산 학습 상태. torchrun 없이 돌리면 enabled=False로 떨어져
+    기존 단일 GPU 경로와 완전히 같게 동작한다."""
+
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    device: str
+
+    @property
+    def is_master(self) -> bool:
+        return self.rank == 0
+
+    def shutdown(self):
+        if self.enabled:
+            # 랭크 0이 마지막 체크포인트를 다 쓰기 전에 다른 랭크가 프로세스
+            # 그룹을 부수면 저장이 깨진다.
+            dist.barrier()
+            dist.destroy_process_group()
+
+
+def setup_ddp() -> DDPContext:
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return DDPContext(
+            False, 0, 0, 1, "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    if not torch.cuda.is_available():
+        raise SystemExit("DDP는 CUDA가 필요하다")
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return DDPContext(True, rank, local_rank, world_size, f"cuda:{local_rank}")
+
+
 def train(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ddp = setup_ddp()
+    device = ddp.device
     tcfg = TrainConfig()
+    tcfg.world_size = ddp.world_size
     if args.batch_size:
         tcfg.batch_size = args.batch_size
     if args.grad_accum:
         tcfg.grad_accum = args.grad_accum
 
-    torch.manual_seed(tcfg.seed)
+    # 랭크마다 시드를 달리 줘야 서로 다른 구간을 뽑는다. 같은 시드면 세 장이
+    # 똑같은 배치를 돌고 all-reduce가 같은 기울기를 평균해, 3배 느려지기만 하고
+    # 1장으로 돌린 것과 결과가 같아진다.
+    torch.manual_seed(tcfg.seed + ddp.rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -240,26 +293,37 @@ def train(args):
     start_iter = 0
     best_val = float("inf")
     if args.resume and resume_path.exists():
-        model, ck = load_checkpoint(resume_path, device)
+        # 모든 랭크가 같은 파일을 직접 읽는다. 랭크 0만 읽고 브로드캐스트하는
+        # 것보다 단순하고 가중치가 어긋날 여지가 없다.
+        raw_model, ck = load_checkpoint(resume_path, device)
         mcfg = ModelConfig(**ck["model_config"])
-        optimizer = make_optimizer(model, tcfg)
+        optimizer = make_optimizer(raw_model, tcfg)
         optimizer.load_state_dict(ck["optimizer"])
         start_iter = ck["iter"] + 1
         best_val = ck["best_val"]
-        print(f"[resume] {resume_path.name}에서 iter {start_iter}부터 재개")
+        if ddp.is_master:
+            print(f"[resume] {resume_path.name}에서 iter {start_iter}부터 재개")
     else:
-        model = Transformer(mcfg).to(device)
-        optimizer = make_optimizer(model, tcfg)
+        raw_model = Transformer(mcfg).to(device)
+        optimizer = make_optimizer(raw_model, tcfg)
 
-    n_params = model.num_params()
-    print("=" * 60)
-    print(f"장치        : {device}")
-    print(f"어휘        : {vocab_size:,}")
-    print(f"파라미터    : {n_params:,}")
-    print(f"학습 토큰   : {len(train_ds):,} / 검증 {len(val_ds):,}")
-    print(f"유효 배치   : {tcfg.tokens_per_iter:,} 토큰/스텝")
-    print(f"스텝        : {tcfg.max_iters:,} (총 {tcfg.max_iters * tcfg.tokens_per_iter / 1e9:.2f}B 토큰)")
-    print("=" * 60)
+    # DDP가 초기 가중치를 랭크 0 기준으로 브로드캐스트하므로, 시드가 랭크마다
+    # 달라도 세 장이 같은 모델로 출발한다.
+    model = DDP(raw_model, device_ids=[ddp.local_rank]) if ddp.enabled else raw_model
+
+    n_params = raw_model.num_params()
+    if ddp.is_master:
+        print("=" * 60)
+        print(f"장치        : {device} (랭크 {ddp.world_size}개)")
+        print(f"어휘        : {vocab_size:,}")
+        print(f"파라미터    : {n_params:,}")
+        print(f"학습 토큰   : {len(train_ds):,} / 검증 {len(val_ds):,}")
+        print(
+            f"유효 배치   : {tcfg.tokens_per_iter:,} 토큰/스텝 "
+            f"(랭크당 {tcfg.batch_size}x{tcfg.grad_accum}x{tcfg.block_size})"
+        )
+        print(f"스텝        : {tcfg.max_iters:,} (총 {tcfg.max_iters * tcfg.tokens_per_iter / 1e9:.2f}B 토큰)")
+        print("=" * 60)
 
     log_path = CKPT_DIR / "trainlog.jsonl"
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -276,58 +340,86 @@ def train(args):
 
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
-        for _ in range(tcfg.grad_accum):
+        for micro in range(tcfg.grad_accum):
             x, y = train_ds.batch(tcfg.batch_size, device)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
-                _, loss, _ = model(x, targets=y)
-            # 누적 스텝 수로 나눠야 전체 배치 평균과 같아진다
-            (loss / tcfg.grad_accum).backward()
+            # 마지막 마이크로스텝에서만 기울기를 동기화한다. 막지 않으면 누적
+            # 횟수만큼(기본 32회) all-reduce가 돌아 DDP 이득이 통신비로 날아간다.
+            last = micro == tcfg.grad_accum - 1
+            sync_ctx = nullcontext() if (last or not ddp.enabled) else model.no_sync()
+            with sync_ctx:
+                with torch.autocast(
+                    "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+                ):
+                    _, loss, _ = model(x, targets=y)
+                # 누적 스텝 수로 나눠야 전체 배치 평균과 같아진다
+                (loss / tcfg.grad_accum).backward()
             total_loss += loss.item() / tcfg.grad_accum
 
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
+        gnorm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), tcfg.grad_clip)
         optimizer.step()
         iters_since_log += 1
 
         if it % tcfg.log_interval == 0:
             dt = time.time() - t0
             tps = tcfg.tokens_per_iter * iters_since_log / max(dt, 1e-9)
-            mem = torch.cuda.max_memory_allocated() / 1024**3 if device == "cuda" else 0
-            print(
-                f"iter {it:6d} | loss {total_loss:.4f} | lr {lr:.2e} "
-                f"| gnorm {gnorm:.2f} | {tps:,.0f} tok/s | vram {mem:.2f}GB",
-                flush=True,
+            mem = (
+                torch.cuda.max_memory_allocated() / 1024**3
+                if device.startswith("cuda")
+                else 0
             )
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {"iter": it, "loss": total_loss, "lr": lr, "gnorm": float(gnorm)}
-                    )
-                    + "\n"
+            if ddp.is_master:
+                print(
+                    f"iter {it:6d} | loss {total_loss:.4f} | lr {lr:.2e} "
+                    f"| gnorm {gnorm:.2f} | {tps:,.0f} tok/s | vram {mem:.2f}GB",
+                    flush=True,
                 )
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {"iter": it, "loss": total_loss, "lr": lr, "gnorm": float(gnorm)}
+                        )
+                        + "\n"
+                    )
             t0 = time.time()
             iters_since_log = 0
 
         if it > 0 and it % tcfg.eval_interval == 0:
-            losses = estimate_loss(model, datasets, tcfg, device)
+            # DDP 래퍼가 아니라 원본으로 돈다. 평가에는 기울기 동기화가 필요 없다.
+            losses = estimate_loss(raw_model, datasets, tcfg, device)
+            if ddp.enabled:
+                # 랭크마다 다른 구간을 봤으므로 평균을 내야 전체 추정이 된다.
+                # 동시에 이 all-reduce가 best_val을 전 랭크에서 같은 값으로 만든다.
+                buf = torch.tensor(
+                    [losses["train"], losses["val"]], device=device, dtype=torch.float32
+                )
+                dist.all_reduce(buf, op=dist.ReduceOp.AVG)
+                losses = {"train": buf[0].item(), "val": buf[1].item()}
             ppl = math.exp(min(losses["val"], 20))
-            print(
-                f"  [eval] iter {it} train {losses['train']:.4f} "
-                f"val {losses['val']:.4f} ppl {ppl:.2f}",
-                flush=True,
-            )
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"iter": it, "eval": losses, "val_ppl": ppl}) + "\n")
+            if ddp.is_master:
+                print(
+                    f"  [eval] iter {it} train {losses['train']:.4f} "
+                    f"val {losses['val']:.4f} ppl {ppl:.2f}",
+                    flush=True,
+                )
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"iter": it, "eval": losses, "val_ppl": ppl}) + "\n")
             if losses["val"] < best_val:
                 best_val = losses["val"]
-                save_checkpoint(
-                    CKPT_DIR / "best.pt", model, optimizer, mcfg, tcfg, it, best_val
-                )
+                if ddp.is_master:
+                    save_checkpoint(
+                        CKPT_DIR / "best.pt", raw_model, optimizer, mcfg, tcfg, it, best_val
+                    )
 
-        if it > 0 and it % tcfg.ckpt_interval == 0:
-            save_checkpoint(resume_path, model, optimizer, mcfg, tcfg, it, best_val)
+        # 전 랭크의 파라미터와 옵티마이저 상태가 동일하므로 마스터만 저장하면 된다.
+        if it > 0 and it % tcfg.ckpt_interval == 0 and ddp.is_master:
+            save_checkpoint(resume_path, raw_model, optimizer, mcfg, tcfg, it, best_val)
 
-    save_checkpoint(resume_path, model, optimizer, mcfg, tcfg, tcfg.max_iters - 1, best_val)
-    print(f"\n학습 종료. best val loss = {best_val:.4f}")
+    if ddp.is_master:
+        save_checkpoint(
+            resume_path, raw_model, optimizer, mcfg, tcfg, tcfg.max_iters - 1, best_val
+        )
+        print(f"\n학습 종료. best val loss = {best_val:.4f}")
+    ddp.shutdown()
 
 
 def main():

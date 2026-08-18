@@ -1,6 +1,8 @@
 # GPU 서버에서 학습하기
 
-로컬(RTX 4050 6GB)에서 만든 것을 A100급 서버로 옮겨 본 학습을 돌리는 절차다.
+로컬(RTX 4050 6GB)에서 만든 것을 GPU 서버로 옮겨 본 학습을 돌리는 절차다.
+아래 수치는 L40S 46GB 4장 서버에서 실측한 값으로 갱신했다. 처음 쓸 때 가정했던
+A100 1장 기준값은 실측과 어긋나 남겨두지 않았다.
 
 ## 먼저 알아둘 것
 
@@ -79,9 +81,9 @@ python data/prepare.py tokenize --workers 16
 python scripts/verify_tokenizer.py
 ```
 
-## 모델 크기 — A100이면 키우는 게 맞다
+## 모델 크기 — 서버급 VRAM이면 키우는 게 맞다
 
-53M은 순전히 노트북 6GB 제약 때문에 고른 값이다. A100 40GB면 그 제약이 없다.
+53M은 순전히 노트북 6GB 제약 때문에 고른 값이다. 40GB대 카드면 그 제약이 없다.
 
 6.6B 토큰에 대한 Chinchilla 최적 모델 크기는 약 330M이다. 53M에 6.6B를 쓰면
 데이터의 6.5배 과잉이라 수익이 크게 체감된다.
@@ -98,7 +100,8 @@ d_ff = 2752
 max_seq_len = 2048      # A100이면 늘릴 수 있다. 코드에 유리하다
 ```
 
-파라미터 약 282.6M. 6.6B 토큰과 Chinchilla 비율이 거의 맞는다.
+파라미터 282,641,408 (적용 완료). 손계산과 일치하는 것을 `tests/test_model.py`로
+확인했다. 6.6B 토큰과 Chinchilla 비율이 거의 맞는다.
 
 `max_seq_len`을 바꾸면 `TrainConfig.block_size`도 같이 맞춰야 한다.
 
@@ -111,42 +114,80 @@ python tests/test_model.py
 
 ## 배치 크기는 실측으로 정한다
 
-계산으로 추정하지 말고 실제로 잰다. A100은 리눅스라 VRAM 초과 시 정직하게
+계산으로 추정하지 말고 실제로 잰다. 리눅스 서버는 VRAM 초과 시 정직하게
 OOM이 나지만(Windows WDDM처럼 시스템 RAM으로 새지 않는다), 그래도 처리량이
 가장 높은 지점은 재봐야 안다.
 
 ```bash
-python scripts/probe_vram.py
+python scripts/probe_vram.py --world-size 3
 ```
 
+`--block`은 `TrainConfig.block_size`에서 자동으로 가져온다. `--world-size`를
+주면 DDP 랭크 수를 반영해 누적 횟수를 계산한다.
+
+L40S 46GB 1장 실측 (282M, block 2048):
+
+| batch | peak VRAM | 초/스텝 | 토큰/초 |
+|---|---|---|---|
+| 1 | 6.61GB | 0.067 | 30,702 |
+| 2 | 9.58GB | 0.107 | 38,447 |
+| **4** | **15.36GB** | **0.205** | **39,899** |
+| 8 | 26.86GB | 0.476 | 34,395 |
+| 12 | 38.52GB | — | 안전선(37.74GB) 초과 |
+
+배치 4가 처리량 정점이고 8부터는 오히려 떨어진다. VRAM이 남는다고 키울 일이
+아니다.
+
 `TrainConfig`의 `batch_size`와 `grad_accum`을 결과에 맞춰 조정한다.
-유효 배치(= batch_size × grad_accum × block_size)는 30만~100만 토큰
-범위가 무난하다.
+유효 배치(= batch_size × grad_accum × block_size × world_size)는
+30만~100만 토큰 범위가 무난하다.
 
 ## 학습
 
 세션이 끊겨도 살아남도록 분리 실행한다. 스텝 수는 `train.bin` 크기에서
 자동 계산된다.
 
+`--gpus`에 두 장 이상을 주면 `torchrun`으로 DDP를 띄우고, 한 장이면 예전처럼
+파이썬을 직접 부른다 — 단일 GPU 경로에 분산 계층을 끼우지 않기 위해서다.
+다른 서비스가 올라가 있는 카드를 피해 번호를 명시하는 편이 안전하다.
+
 ```bash
-python scripts/train_detached.py start
+python scripts/train_detached.py start --gpus 1,2,3 --batch-size 4 --grad-accum 21
 ```
 
 ```bash
 python scripts/train_detached.py status
 ```
 
+```bash
+python scripts/train_detached.py stop
+```
+
+`stop`은 프로세스 그룹째 신호를 보낸다. torchrun만 죽이면 워커가 GPU를 쥔 채
+고아로 남아 다음 학습이 OOM으로 죽는다.
+
 리눅스에서는 `tmux`나 `nohup`도 같은 목적을 달성한다.
 
-예상 시간(A100 40GB, MFU 40% 가정):
+예상 시간(L40S 46GB, 실측 tok/s 기준):
 
-| 모델 | 6.6B 토큰 |
-|---|---|
-| 53M | 약 6시간 |
-| 282M | 약 25시간 |
+| 모델 | 카드 | 6.6B 토큰 |
+|---|---|---|
+| 282M | 1장 | 약 46시간 |
+| 282M | **3장 DDP** | **약 15시간** |
 
-MFU는 구현과 배치에 따라 크게 달라진다. 첫 100스텝의 tok/s를 보고 다시
-계산할 것.
+3장 값은 랭크당 39,899 tok/s를 단순 3배한 추정이라 통신 비용이 빠져 있다.
+실제로는 이보다 늘어난다. 첫 100스텝의 tok/s를 보고 다시 계산할 것.
+
+### DDP에서 주의할 것
+
+유효 배치가 랭크 수만큼 곱해진다. `grad_accum`을 그만큼 줄이지 않으면 의도한
+것보다 3배 큰 배치로 학습되고 lr 스케줄이 어긋난다. `TrainConfig.world_size`가
+`tokens_per_iter`에 반영돼 있어 총 스텝 수는 자동으로 맞지만, 배치 크기 자체는
+직접 정해야 한다.
+
+검증은 `tests/test_ddp.py`에 있다. 랭크별 시드 분리, 초기 가중치 브로드캐스트,
+`no_sync` 누적이 통짜 평균과 일치하는지, 체크포인트에 `module.` 접두사가 안
+붙는지를 본다. 마지막 항목이 로컬에서 체크포인트를 여는 것과 직결된다.
 
 ## Colab을 쓰는 경우
 

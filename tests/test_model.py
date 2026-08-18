@@ -183,7 +183,7 @@ def c_param_count():
     expect = emb + cfg.n_layers * (attn + ffn + norms) + cfg.d_model
 
     assert n == expect, f"파라미터 수 불일치: 실제 {n:,} vs 계산 {expect:,}"
-    assert 50e6 < n < 57e6, f"설계 목표(약 53M)에서 벗어남: {n:,}"
+    assert 275e6 < n < 290e6, f"설계 목표(약 282.6M)에서 벗어남: {n:,}"
     return f"{n:,} 파라미터 (손계산과 일치, 비임베딩 {m.num_params(True):,})"
 
 

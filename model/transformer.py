@@ -25,12 +25,15 @@ import torch.nn.functional as F
 @dataclass
 class ModelConfig:
     vocab_size: int = 16384
-    d_model: int = 640
-    n_layers: int = 10
-    n_heads: int = 10
-    n_kv_heads: int = 2
-    d_ff: int = 1728
-    max_seq_len: int = 1024
+    # 아래 폭/깊이는 L40S 46GB 서버용이다. 원래 값(640/10/10/2/1728, 53M)은
+    # 노트북 6GB 제약에서 나온 것이라 46GB에서는 데이터가 6배 과잉이 된다.
+    # 6.6B 토큰의 Chinchilla 최적점이 약 330M이라 282.6M로 맞췄다.
+    d_model: int = 1024
+    n_layers: int = 24
+    n_heads: int = 16
+    n_kv_heads: int = 4
+    d_ff: int = 2752
+    max_seq_len: int = 2048
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
     tie_embeddings: bool = True

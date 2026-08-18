@@ -8,6 +8,7 @@
 를 함께 봐야 한다. 이 둘 중 하나라도 걸리면 실패로 처리한다.
 """
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from model.transformer import ModelConfig, Transformer
+from train.train import TrainConfig
 from train.train import TrainConfig, make_optimizer
 
 
@@ -72,8 +74,31 @@ def probe(batch_size: int, block_size: int, vocab_size: int = 16384):
         return False, float("nan"), float("nan"), f"{type(e).__name__}: {e}"
 
 
+def parse_args():
+    ap = argparse.ArgumentParser()
+    # 기본값을 TrainConfig에서 끌어온다. 하드코딩하면 block_size를 바꿀 때마다
+    # 프로브가 조용히 옛날 길이로 재서 엉뚱한 배치를 권한다.
+    ap.add_argument("--block", type=int, default=TrainConfig().block_size)
+    ap.add_argument(
+        "--batches",
+        default="1,2,4,8,12,16,24,32",
+        help="시험할 batch_size 목록",
+    )
+    ap.add_argument(
+        "--world-size", type=int, default=1, help="DDP 랭크 수. 유효 배치 계산에 쓴다"
+    )
+    ap.add_argument(
+        "--target-tokens",
+        type=int,
+        default=524288,
+        help="목표 유효 배치(토큰/스텝). 30만~100만이 무난하다",
+    )
+    return ap.parse_args()
+
+
 def main():
     global TOTAL_GB
+    args = parse_args()
     if not torch.cuda.is_available():
         print("CUDA가 없다")
         return 1
@@ -82,15 +107,16 @@ def main():
     TOTAL_GB = total / 1024**3
     print(f"VRAM: 가용 {free / 1024**3:.2f}GB / 전체 {TOTAL_GB:.2f}GB")
     print(f"안전선: {TOTAL_GB * SAFE_FRAC:.2f}GB (넘으면 시스템 RAM 유출)")
-    print(f"모델: {Transformer(ModelConfig()).num_params():,} 파라미터\n")
+    print(f"모델: {Transformer(ModelConfig()).num_params():,} 파라미터")
+    print(f"문맥: {args.block} 토큰, 랭크 {args.world_size}개\n")
 
     print(f"{'batch':>6} {'peak':>9} {'초/스텝':>9} {'토큰/초':>10}  결과")
     print("-" * 62)
     best = None
     rows = []
-    for batch_size in (1, 2, 4, 6, 8):
-        ok, peak, sec, detail = probe(batch_size, 1024)
-        tps = batch_size * 1024 / sec if sec == sec and sec > 0 else float("nan")
+    for batch_size in [int(b) for b in args.batches.split(",") if b.strip()]:
+        ok, peak, sec, detail = probe(batch_size, args.block)
+        tps = batch_size * args.block / sec if sec == sec and sec > 0 else float("nan")
         rows.append((batch_size, ok, peak, sec, tps))
         print(
             f"{batch_size:>6} {peak:>8.2f}G {sec:>9.3f} {tps:>10,.0f}  "
@@ -113,12 +139,18 @@ def main():
         return 1
 
     bs = best[0]
-    accum = max(1, 131072 // (bs * 1024))
-    eff = bs * accum * 1024
+    # DDP는 랭크 수만큼 유효 배치가 곱해지므로, 누적 횟수를 그만큼 줄여야
+    # 목표 유효 배치가 유지된다. 안 줄이면 의도의 world_size배로 학습된다.
+    per_rank_target = max(1, args.target_tokens // args.world_size)
+    accum = max(1, per_rank_target // (bs * args.block))
+    eff = bs * accum * args.block * args.world_size
     print(f"판정: 통과 - batch_size {bs} 권장 (peak {best[2]:.2f}GB, {best[4]:,.0f} tok/s)")
-    print(f"  기울기 누적 {accum} -> 유효 배치 {eff:,} 토큰/스텝")
-    est_h = 1e9 / best[4] / 3600
-    print(f"  1B 토큰 학습 추정 시간: {est_h:.1f}시간")
+    print(f"  기울기 누적 {accum} -> 유효 배치 {eff:,} 토큰/스텝 (랭크 {args.world_size}개 합산)")
+    total_tps = best[4] * args.world_size
+    est_h = 6.6e9 / total_tps / 3600
+    print(f"  전 랭크 합산 처리량 추정: {total_tps:,.0f} tok/s")
+    print(f"  6.6B 토큰 학습 추정 시간: {est_h:.1f}시간")
+    print(f"\n  train_detached.py start --gpus <목록> --batch-size {bs} --grad-accum {accum}")
     return 0
 
 
