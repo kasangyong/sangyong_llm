@@ -8,6 +8,7 @@ PyTorch에서 빌려 쓰는 것은 텐서 연산 / autograd / CUDA / 융합 어�
 `tokenizers`, `datasets` 라이브러리는 쓰지 않는다.
 
 설계 근거와 시행착오는 [docs/design/2026-08-13-sangyong-llm-design.md](docs/design/2026-08-13-sangyong-llm-design.md)에 있다.
+GPU 서버나 Colab에서 돌리려면 [docs/SERVER_SETUP.md](docs/SERVER_SETUP.md)를 본다.
 
 ## 구성
 
