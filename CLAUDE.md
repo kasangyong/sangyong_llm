@@ -79,7 +79,7 @@ compute capability로 고른다. fp16을 쓰면 기울기 클리핑이 반드시
 python scripts/run_tests.py
 ```
 
-8개 스위트 136항목. GPU가 학습으로 점유 중이면 `verify_env.py`의 가용 VRAM
+8개 스위트 138항목. GPU가 학습으로 점유 중이면 `verify_env.py`의 가용 VRAM
 검사가 걸릴 수 있는데, 그건 올바른 동작이다.
 
 ## 며칠짜리 학습

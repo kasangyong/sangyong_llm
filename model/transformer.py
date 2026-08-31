@@ -53,6 +53,33 @@ SMOKE_CONFIG = ModelConfig(
     d_model=320, n_layers=6, n_heads=5, n_kv_heads=1, d_ff=864, max_seq_len=512
 )
 
+# 학습 대상 설정. 노트북에서 고른 값과 서버에서 고른 값이 다르다.
+#
+#   53m  : RTX 4050 6GB 기준. 순전히 VRAM 상한에서 역산한 크기다.
+#          1.07B 토큰(Chinchilla 최적)에 맞는다.
+#   282m : V100S 32GB 기준. 6.6B 토큰의 Chinchilla 최적치가 약 330M이라
+#          비율이 대체로 맞는다. 같은 6.6B를 53M에 쓰면 데이터가 6배 과잉이다.
+#
+# vocab_size는 어느 쪽도 건드리지 않는다. 16,384가 임베딩 크기와 묶여 있어
+# 바꾸는 순간 기존 체크포인트와 토크나이저가 전부 무용지물이 된다.
+PRESETS: dict[str, dict] = {
+    "53m": dict(
+        d_model=640, n_layers=10, n_heads=10, n_kv_heads=2,
+        d_ff=1728, max_seq_len=1024,
+    ),
+    "282m": dict(
+        d_model=1024, n_layers=24, n_heads=16, n_kv_heads=4,
+        d_ff=2752, max_seq_len=2048,
+    ),
+}
+
+
+def make_config(name: str, vocab_size: int, **overrides) -> ModelConfig:
+    """프리셋 이름으로 ModelConfig를 만든다. 어휘 크기는 토크나이저가 정한다."""
+    if name not in PRESETS:
+        raise ValueError(f"모르는 프리셋: {name!r} (가능: {sorted(PRESETS)})")
+    return ModelConfig(vocab_size=vocab_size, **{**PRESETS[name], **overrides})
+
 
 class RMSNorm(nn.Module):
     """LayerNorm에서 평균 빼기를 없앤 버전. 더 싸고 성능은 같다."""

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -29,10 +30,25 @@ ROOT = Path(__file__).resolve().parent.parent
 CKPT_DIR = ROOT / "checkpoints"
 PID_FILE = CKPT_DIR / "train.pid"
 LOG_FILE = CKPT_DIR / "train_stdout.log"
-PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+# 리눅스 서버에는 Scripts/python.exe가 없다. 둘 다 보고 있는 쪽을 쓴다.
+_WIN = ROOT / ".venv" / "Scripts" / "python.exe"
+_NIX = ROOT / ".venv" / "bin" / "python"
+PYTHON = _WIN if _WIN.exists() else _NIX
+
+
+IS_WINDOWS = os.name == "nt"
 
 
 def _alive(pid: int) -> bool:
+    if not IS_WINDOWS:
+        # 신호 0은 실제로 보내지 않고 존재 여부만 확인한다.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # 남의 프로세스지만 살아 있다
+        return True
     out = subprocess.run(
         ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
         capture_output=True,
@@ -60,6 +76,10 @@ def cmd_start(args):
     cmd = [str(PYTHON), "-u", str(ROOT / "train" / "train.py")]
     if args.resume:
         cmd.append("--resume")
+    if args.model:
+        cmd += ["--model", args.model]
+    if args.precision:
+        cmd += ["--precision", args.precision]
     if args.epochs is not None:
         cmd += ["--epochs", str(args.epochs)]
     if args.batch_size:
@@ -74,8 +94,16 @@ def cmd_start(args):
     log.write(f"[detached] {' '.join(cmd)}\n{'=' * 60}\n")
     log.flush()
 
-    # CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS: 부모가 죽어도 안 따라 죽는다.
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    # 부모가 죽어도 따라 죽지 않게 떼어낸다. Windows는 프로세스 그룹 분리
+    # 플래그, POSIX는 setsid(start_new_session)로 세션을 새로 판다. SSH가
+    # 끊길 때 날아오는 SIGHUP이 새 세션에는 전달되지 않는다.
+    if IS_WINDOWS:
+        extra = {
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.DETACHED_PROCESS
+        }
+    else:
+        extra = {"start_new_session": True}
     proc = subprocess.Popen(
         cmd,
         cwd=str(ROOT),
@@ -83,8 +111,8 @@ def cmd_start(args):
         stdout=log,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
-        creationflags=creationflags,
         close_fds=True,
+        **extra,
     )
     PID_FILE.write_text(str(proc.pid))
     print(f"분리 실행 시작: PID {proc.pid}")
@@ -127,7 +155,14 @@ def cmd_stop(args):
     if pid is None or not _alive(pid):
         print("돌고 있는 학습이 없다.")
         return
-    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+    else:
+        # SIGTERM으로 먼저 부탁한다. 체크포인트 저장 중이면 그게 끝나고 죽는다.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     for _ in range(20):
         if not _alive(pid):
             break
@@ -142,6 +177,8 @@ def main():
 
     p = sub.add_parser("start")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--model", default=None, help="53m / 282m (train.py 기본값 53m)")
+    p.add_argument("--precision", default=None, help="auto / bf16 / fp16 / fp32")
     p.add_argument("--epochs", type=float, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--grad-accum", type=int, default=None)

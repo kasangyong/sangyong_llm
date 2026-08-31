@@ -136,24 +136,26 @@ python train/train.py --precision fp16
 6.6B 토큰에 대한 Chinchilla 최적 모델 크기는 약 330M이다. 53M에 6.6B를 쓰면
 데이터의 6.5배 과잉이라 수익이 크게 체감된다.
 
-`model/transformer.py`의 `ModelConfig` 기본값을 이렇게 바꾼다:
+설정을 손으로 고칠 필요는 없다. `model/transformer.py`에 프리셋이 들어 있다.
 
-```python
-vocab_size = 16384      # 바꾸지 말 것
-d_model = 1024
-n_layers = 24
-n_heads = 16            # head_dim 64
-n_kv_heads = 4          # GQA
-d_ff = 2752
-max_seq_len = 2048      # 32GB면 늘릴 수 있다. 코드에 유리하다
+| 프리셋 | d_model | 층 | heads | KV | d_ff | context | 파라미터 |
+|---|---|---|---|---|---|---|---|
+| `53m` | 640 | 10 | 10 | 2 | 1728 | 1024 | 53,507,200 |
+| `282m` | 1024 | 24 | 16 | 4 | 2752 | 2048 | 282,641,408 |
+
+`--model`로 고른다. `TrainConfig.block_size`는 프리셋의 `max_seq_len`으로
+자동으로 맞춰진다 — 손으로 두 곳을 고치다 어긋나는 사고를 막기 위해서다.
+
+```bash
+python train/train.py --model 282m
 ```
 
-파라미터 약 282.6M. 6.6B 토큰과 Chinchilla 비율이 거의 맞는다.
+`vocab_size`는 어느 프리셋도 정하지 않는다. 항상 `tokenizer/tokenizer.json`에서
+읽는다. 16,384가 임베딩 크기와 묶여 있어 바꾸면 체크포인트가 전부 무용지물이
+되기 때문이다.
 
-`max_seq_len`을 바꾸면 `TrainConfig.block_size`도 같이 맞춰야 한다.
-
-바꾼 뒤 반드시 모델 검증을 다시 돌린다. 파라미터 수 손계산 테스트가
-새 설정에 맞게 갱신돼야 한다.
+프리셋을 손대면 파라미터 수 손계산 테스트가 잡는다. 282,641,408을 못으로
+박아뒀다.
 
 ```bash
 python tests/test_model.py
@@ -166,27 +168,34 @@ OOM이 나지만(Windows WDDM처럼 시스템 RAM으로 새지 않는다), 그�
 가장 높은 지점은 재봐야 안다.
 
 ```bash
-python scripts/probe_vram.py
+python scripts/probe_vram.py --model 282m
 ```
 
 `TrainConfig`의 `batch_size`와 `grad_accum`을 결과에 맞춰 조정한다.
+프로브가 권장 유효 배치(282m 기준 524,288 토큰/스텝)에 맞는 누적 수와
+2.68B / 6.6B 토큰 예상 시간까지 같이 계산해준다.
 유효 배치(= batch_size × grad_accum × block_size)는 30만~100만 토큰
 범위가 무난하다.
 
 ## 학습
 
-세션이 끊겨도 살아남도록 분리 실행한다. 스텝 수는 `train.bin` 크기에서
-자동 계산된다.
+세션이 끊겨도 살아남도록 분리 실행한다. 스텝 수는 `train.bin` 크기와
+`--epochs`에서 자동 계산된다.
 
 ```bash
-python scripts/train_detached.py start
+python scripts/train_detached.py start --model 282m
 ```
 
 ```bash
 python scripts/train_detached.py status
 ```
 
-리눅스에서는 `tmux`나 `nohup`도 같은 목적을 달성한다.
+POSIX에서는 `start_new_session`으로 세션을 새로 파서 SSH가 끊길 때 오는
+SIGHUP을 안 받는다. `tmux`나 `nohup`도 같은 목적을 달성하므로, 이미 tmux를
+쓰고 있으면 그 안에서 `train.py`를 직접 돌려도 된다.
+
+**`--model`을 빼면 기본값 53m으로 돈다.** 헤더에 모델 이름과 파라미터 수가
+찍히니 첫 줄을 확인할 것.
 
 예상 시간(V100S 32GB 1장, fp16, MFU 30~40% **가정** — 실측 아님):
 
@@ -234,7 +243,7 @@ python eval/harness.py --ckpt checkpoints/best.pt --k 5
 
 ## 현재 상태 (2026-08-31)
 
-- 검증 136항목 통과 (8개 스위트). fp16 전환과 회귀 테스트 2건 포함
+- 검증 138항목 통과 (8개 스위트). fp16 전환, 282m 프리셋, 회귀 테스트 포함
 - 로컬에서 53M을 1B 토큰으로 250스텝까지 돌려봤다.
   train 3.7225 / val 3.7627 / ppl 43.06. 과적합 징후 없음
 - 54샤드 필터 완료: 2,868,339 문서 / 24.2GB

@@ -8,6 +8,7 @@
 를 함께 봐야 한다. 이 둘 중 하나라도 걸리면 실패로 처리한다.
 """
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -19,22 +20,27 @@ import torch
 
 from model.precision import autocast, label, needs_scaler
 from model.precision import resolve as resolve_precision
-from model.transformer import ModelConfig, Transformer
+from model.transformer import PRESETS, Transformer, make_config
 from train.train import TrainConfig, make_optimizer
 
 
 TOTAL_GB = 6.0  # 실행 시 실측으로 덮어씀
 SAFE_FRAC = 0.85  # 이 비율을 넘으면 시스템 RAM 유출로 본다
 
+# 권장 유효 배치(토큰/스텝). 모델이 커지면 배치도 같이 키워야 기울기 잡음이
+# 상대적으로 줄어든다. 최종 값은 손실 곡선을 보고 조정할 것.
+TARGET_TOKENS = {"53m": 131_072, "282m": 524_288}
 
-def probe(batch_size: int, block_size: int, vocab_size: int = 16384):
+
+def probe(batch_size: int, model_name: str = "53m", vocab_size: int = 16384):
     """(안전 여부, peak GB, 스텝 초, 설명) 반환."""
     amp_dtype, _ = resolve_precision("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler(amp_dtype))
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     try:
-        cfg = ModelConfig(vocab_size=vocab_size, max_seq_len=block_size)
+        cfg = make_config(model_name, vocab_size)
+        block_size = cfg.max_seq_len
         model = Transformer(cfg).cuda()
         opt = make_optimizer(model, TrainConfig())
         x = torch.randint(0, vocab_size, (batch_size, block_size), device="cuda")
@@ -82,6 +88,10 @@ def probe(batch_size: int, block_size: int, vocab_size: int = 16384):
 
 def main():
     global TOTAL_GB
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", choices=sorted(PRESETS), default="53m")
+    args = ap.parse_args()
+
     if not torch.cuda.is_available():
         print("CUDA가 없다")
         return 1
@@ -92,7 +102,10 @@ def main():
     print(f"안전선: {TOTAL_GB * SAFE_FRAC:.2f}GB (넘으면 시스템 RAM 유출)")
     amp_dtype, why = resolve_precision("cuda")
     print(f"정밀도: {label(amp_dtype)} ({why})")
-    print(f"모델: {Transformer(ModelConfig()).num_params():,} 파라미터\n")
+    mcfg = make_config(args.model, 16384)
+    block_size = mcfg.max_seq_len
+    print(f"모델: {args.model} / {Transformer(mcfg).num_params():,} 파라미터"
+          f" / context {block_size}\n")
 
     print(f"{'batch':>6} {'peak':>9} {'초/스텝':>9} {'토큰/초':>10}  결과")
     print("-" * 62)
@@ -101,8 +114,8 @@ def main():
     # 32GB급 카드에서는 6GB 노트북용 상한(8)으로 최적점을 못 찾는다.
     # 한 번 넘치면 아래 break가 멈추므로 위쪽을 넉넉히 열어둔다.
     for batch_size in (1, 2, 4, 8, 12, 16, 24, 32, 48, 64):
-        ok, peak, sec, detail = probe(batch_size, 1024)
-        tps = batch_size * 1024 / sec if sec == sec and sec > 0 else float("nan")
+        ok, peak, sec, detail = probe(batch_size, args.model)
+        tps = batch_size * block_size / sec if sec == sec and sec > 0 else float("nan")
         rows.append((batch_size, ok, peak, sec, tps))
         print(
             f"{batch_size:>6} {peak:>8.2f}G {sec:>9.3f} {tps:>10,.0f}  "
@@ -125,12 +138,14 @@ def main():
         return 1
 
     bs = best[0]
-    accum = max(1, 131072 // (bs * 1024))
-    eff = bs * accum * 1024
+    target = TARGET_TOKENS[args.model]
+    accum = max(1, target // (bs * block_size))
+    eff = bs * accum * block_size
     print(f"판정: 통과 - batch_size {bs} 권장 (peak {best[2]:.2f}GB, {best[4]:,.0f} tok/s)")
     print(f"  기울기 누적 {accum} -> 유효 배치 {eff:,} 토큰/스텝")
-    est_h = 1e9 / best[4] / 3600
-    print(f"  1B 토큰 학습 추정 시간: {est_h:.1f}시간")
+    for name_, ntok in (("2.68B", 2.68e9), ("6.6B", 6.6e9)):
+        est_h = ntok / best[4] / 3600
+        print(f"  {name_} 토큰 학습 추정: {est_h:,.1f}시간 ({est_h / 24:.1f}일)")
     return 0
 
 

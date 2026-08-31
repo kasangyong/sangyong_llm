@@ -37,13 +37,28 @@ GPU 서버나 Colab에서 돌리려면 [docs/SERVER_SETUP.md](docs/SERVER_SETUP.
 
 ## 모델
 
-| 항목 | 값 |
-|---|---|
-| 파라미터 | 53,507,200 |
-| d_model / layers / heads | 640 / 10 / 10 |
-| KV heads (GQA) | 2 |
-| FFN | SwiGLU, d_ff 1728 |
-| vocab / context | 16,384 / 1,024 |
+크기는 GPU가 정한다. `model/transformer.py`의 프리셋을 `--model`로 고른다.
+
+| 항목 | `53m` (기본) | `282m` |
+|---|---|---|
+| 파라미터 | 53,507,200 | 282,641,408 |
+| d_model / layers / heads | 640 / 10 / 10 | 1024 / 24 / 16 |
+| KV heads (GQA) | 2 | 4 |
+| FFN | SwiGLU, d_ff 1728 | SwiGLU, d_ff 2752 |
+| context | 1,024 | 2,048 |
+| 기준 하드웨어 | RTX 4050 6GB | V100S 32GB |
+
+`53m`은 순전히 노트북 6GB 상한에서 역산한 크기다. `282m`은 6.6B 토큰의
+Chinchilla 최적치(약 330M)에 맞춘 것으로, 같은 데이터를 53M에 쓰면 6배
+과잉이라 수익이 크게 체감된다.
+
+vocab은 두 프리셋 공통 **16,384**이며 프리셋이 정하지 않는다. 항상
+`tokenizer/tokenizer.json`에서 읽는다 — 어휘가 바뀌면 임베딩 크기가 달라져
+기존 체크포인트가 전부 무용지물이 되기 때문이다.
+
+```bash
+python train/train.py --model 282m
+```
 
 ## 실행
 
@@ -209,7 +224,7 @@ result = run_with_search(
 |---|---|---|
 | `verify_env.py` | 9 | GPU 행렬곱 정확도, 정밀도 실측 TFLOPS, GQA SDPA, 가용 VRAM |
 | `test_tokenizer.py` | 13 | 적대적 입력 28종, 무작위 유니코드 1000건, 어휘 크기 불변 |
-| `test_model.py` | 14 | 인과 마스크 누설, RoPE 상대위치, KV 캐시 등가 |
+| `test_model.py` | 16 | 인과 마스크 누설, RoPE 상대위치, KV 캐시 등가, 프리셋 크기 고정 |
 | `test_training.py` | 10 | 기울기 누적 등가, 단일배치 과적합, 재개 궤적, fp16 클리핑 순서 |
 | `test_eval.py` | 12 | 정답/오답 판별, `sys.exit(0)` 우회 차단 |
 | `test_sft.py` | 23 | 손실 마스킹 경계, 어휘 불변, 평가가 에포크를 갉아먹는지 |

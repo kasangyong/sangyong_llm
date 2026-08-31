@@ -24,7 +24,7 @@ import torch
 
 from model.precision import autocast, label, needs_scaler
 from model.precision import resolve as resolve_precision
-from model.transformer import ModelConfig, Transformer
+from model.transformer import PRESETS, ModelConfig, Transformer, make_config
 
 ROOT = Path(__file__).resolve().parent.parent
 PROC_DIR = ROOT / "data" / "processed"
@@ -263,7 +263,10 @@ def train(args):
         "n_reserved", 0
     )
 
-    mcfg = ModelConfig(vocab_size=vocab_size, max_seq_len=tcfg.block_size)
+    mcfg = make_config(args.model, vocab_size)
+    # block_size와 모델 컨텍스트가 어긋나면 RoPE 캐시 범위를 넘거나(크면)
+    # 컨텍스트를 놀리게(작으면) 된다. 모델 쪽을 진실로 삼는다.
+    tcfg.block_size = mcfg.max_seq_len
     train_ds = BinDataset(PROC_DIR / "train.bin", tcfg.block_size)
     val_ds = BinDataset(PROC_DIR / "val.bin", tcfg.block_size)
     datasets = {"train": train_ds, "val": val_ds}
@@ -282,6 +285,13 @@ def train(args):
     if args.resume and resume_path.exists():
         model, ck = load_checkpoint(resume_path, device)
         mcfg = ModelConfig(**ck["model_config"])
+        # 체크포인트가 --model과 다른 크기면 여기서 멈춘다. 그냥 두면 데이터
+        # 슬라이싱만 어긋난 채로 학습이 계속 돌아간다.
+        if mcfg.max_seq_len != tcfg.block_size:
+            raise SystemExit(
+                f"체크포인트 컨텍스트 {mcfg.max_seq_len} != --model {args.model}의 "
+                f"{tcfg.block_size}. 같은 크기로 재개하거나 --resume을 뺄 것."
+            )
         optimizer = make_optimizer(model, tcfg)
         optimizer.load_state_dict(ck["optimizer"])
         start_iter = ck["iter"] + 1
@@ -297,6 +307,8 @@ def train(args):
     print("=" * 60)
     print(f"장치        : {device}")
     print(f"어휘        : {vocab_size:,}")
+    print(f"모델        : {args.model} (d_model {mcfg.d_model}, {mcfg.n_layers}층, "
+          f"context {mcfg.max_seq_len})")
     print(f"파라미터    : {n_params:,}")
     print(f"학습 토큰   : {len(train_ds):,} / 검증 {len(val_ds):,}")
     print(f"정밀도      : {tcfg.precision} ({precision_why})")
@@ -395,6 +407,10 @@ def train(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument(
+        "--model", choices=sorted(PRESETS), default="53m",
+        help="53m = 노트북 6GB 기준 / 282m = 32GB 서버 기준",
+    )
     ap.add_argument(
         "--epochs", type=float, default=1.0, help="데이터를 몇 바퀴 돌지 (max-iters 미지정 시)"
     )

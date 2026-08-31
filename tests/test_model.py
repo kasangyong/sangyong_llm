@@ -15,10 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from model.transformer import (
+    PRESETS,
     ModelConfig,
     Transformer,
     apply_rope,
     build_rope_cache,
+    make_config,
 )
 
 RESULTS = []
@@ -187,6 +189,45 @@ def c_param_count():
     return f"{n:,} 파라미터 (손계산과 일치, 비임베딩 {m.num_params(True):,})"
 
 
+def c_param_count_282m():
+    """서버용 282m 프리셋도 손계산과 맞는가.
+
+    프리셋을 손대면 여기서 걸린다. 크기가 바뀌면 그 설정으로 만든 체크포인트가
+    전부 못 쓰게 되므로 숫자를 못으로 박아둔다.
+    """
+    assert "vocab_size" not in PRESETS["282m"], (
+        "프리셋이 vocab_size를 정하면 안 된다. 어휘는 토크나이저가 진실이다."
+    )
+    cfg = make_config("282m", 16384)
+    m = Transformer(cfg)
+    n = m.num_params()
+
+    emb = cfg.vocab_size * cfg.d_model
+    hd = cfg.head_dim
+    attn = cfg.d_model * cfg.n_heads * hd * 2 + cfg.d_model * cfg.n_kv_heads * hd * 2
+    ffn = 3 * cfg.d_model * cfg.d_ff
+    norms = 2 * cfg.d_model
+    expect = emb + cfg.n_layers * (attn + ffn + norms) + cfg.d_model
+
+    assert n == expect, f"파라미터 수 불일치: 실제 {n:,} vs 계산 {expect:,}"
+    assert n == 282_641_408, f"282m 프리셋 크기가 바뀌었다: {n:,}"
+    assert cfg.vocab_size == 16384, f"어휘가 16,384가 아니다: {cfg.vocab_size}"
+    assert cfg.max_seq_len == 2048, f"컨텍스트가 2048이 아니다: {cfg.max_seq_len}"
+    return f"{n:,} 파라미터, context {cfg.max_seq_len} (손계산과 일치)"
+
+
+def c_preset_53m_matches_defaults():
+    """53m 프리셋은 ModelConfig 기본값과 같아야 한다.
+
+    다르면 --model 없이 돌린 학습과 --model 53m으로 돌린 학습이 서로 다른
+    모델이 되는데, 체크포인트 파일만 봐서는 구분이 안 된다.
+    """
+    a = make_config("53m", 16384)
+    b = ModelConfig(vocab_size=16384)
+    assert a == b, f"53m 프리셋이 기본값과 다르다: {a} vs {b}"
+    return "53m 프리셋 == ModelConfig 기본값"
+
+
 def c_weight_tying():
     """입출력 임베딩이 실제로 같은 텐서여야 한다."""
     m = _model()
@@ -307,6 +348,8 @@ def main():
     check("KV 캐시 == 통짜 forward", c_kv_cache_matches_full)
     check("KV 캐시 오용 거부", c_kv_cache_rejects_bad_use)
     check("파라미터 수 손계산 일치", c_param_count)
+    check("282m 프리셋 파라미터 수", c_param_count_282m)
+    check("53m 프리셋 == 기본값", c_preset_53m_matches_defaults)
     check("가중치 공유", c_weight_tying)
     check("초기 손실 = ln(V)", c_init_loss)
     check("기울기 흐름", c_gradients_flow)
