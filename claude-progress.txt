@@ -180,3 +180,90 @@ CPU 테스트를 돌리는 동안 처리량이 10,100 -> 7,300 tok/s로 잠깐 �
 회복했다. README에 finetune/·tools/ 구성 항목, SFT/검색 실행 절차, 검증 표
 3줄을 추가하고 한계 항목을 갱신했다(기반 모델 없어 SFT 미실행, 검색은 API
 키 필요, 한국어 마커의 토큰 비용).
+
+## 2026-08-31 — V100 서버 이전, fp16 전환, 282M 결정
+
+학습을 SSAFY GPU 서버(Tesla V100S-PCIE-32GB 10장 중 3번 1장)로 옮기기로
+하고, 그 하드웨어에서 실제로 돌 수 있게 코드를 고쳤다. 커밋 3개.
+
+### V100 실측에서 나온 것
+
+fp32 13.2 / fp16 88.8 / bf16 10.0 TFLOPS. bf16이 fp32보다 느리다 —
+sm_70에는 bf16 텐서코어가 없고 소프트웨어 에뮬레이션만 있기 때문이다.
+그런데 torch.cuda.is_bf16_supported()는 V100에서도 True를 반환한다.
+지원 여부만 보던 verify_env.py가 거짓 통과시키고 있었다.
+
+또 최신 PyTorch(2.11+)는 Volta를 빌드 타겟에서 뺐다(최소 sm_75). README의
+cu128을 깔면 "no kernel image is available"로 죽는다. sm_70이 들어 있는
+마지막 조합은 torch 2.6.0 + cu124다.
+
+### 고친 것
+
+model/precision.py를 새로 만들어 compute capability로 dtype을 고른다
+(sm_80 이상 bf16 / 미만 fp16). verify_env.py는 지원 여부가 아니라 실측
+TFLOPS가 fp32보다 빠른지를 판정 근거로 쓴다.
+
+fp16이라 GradScaler가 붙었다. 여기서 조용히 망가지는 지점을 먼저
+재현했다 — 기울기 클리핑을 scaler.unscale_() 앞에 두면 스케일된 기울기를
+자르게 되어 유효 학습률이 무너진다. 실측(scale 128, clip 1.0):
+
+  unscale -> clip  보고 gnorm 0.2500  클리핑 후 실제 노름 0.2500
+  clip -> unscale  보고 gnorm 31.999  클리핑 후 실제 노름 0.0078
+
+보고 gnorm이 128배 부풀려지는 건 부수적이고 실제 기울기가 32배 축소된다.
+손실 곡선에는 아무 징후가 없다. clip_and_step() 하나로 순서를 고정하고
+회귀 테스트를 붙였다. 변이 주입으로 그 테스트가 실제로 잡는 것까지 확인했다.
+fp16 손실 스케일은 체크포인트에 함께 저장한다.
+
+### 모델 크기 결정
+
+53M은 노트북 6GB 상한에서 역산한 값이라 32GB에서는 작다. 사용자 판단으로
+282M + 54샤드 전량(약 6.6B 토큰)으로 간다. ModelConfig 기본값을 갈아끼우지
+않고 PRESETS(53m/282m)로 뺐다 — 기본값을 바꾸면 --model 없이 돌린 학습과
+명시한 학습이 서로 다른 모델이 되는데 체크포인트만 봐서는 구분이 안 된다.
+
+  53m   53,507,200  d_model 640  10층  context 1024
+  282m 282,641,408  d_model 1024 24층  context 2048
+
+예상 시간 4.4~6.1일 (FLOPs/token = 6N + 6·L·T·d = 2.00G, 실효 22~35 TFLOPS
+가정). 처음에 4.3일이라고 적었던 것은 어텐션 항을 빼먹은 값이라 정정했다.
+
+train_detached.py를 POSIX에서도 쓸 수 있게 고쳤다(start_new_session /
+signal 0 / SIGTERM). SERVER_SETUP이 서버에서 이걸 쓰라고 안내하는데
+tasklist와 CREATE_NEW_PROCESS_GROUP은 Windows 전용이라 리눅스에서 죽었다.
+
+검증: 8개 스위트 138항목 통과. fp16/bf16/fp32가 같은 지점으로 수렴
+(53M 축소판 120스텝, loss 5.59 -> 0.0593/0.0590/0.0596, NaN 0, 스킵 0).
+
+### 서버에서 진행 중
+
+git pull -> verify_env -> run_tests -> download 54샤드 -> filter ->
+tokenize -> probe_vram --model 282m -> train_detached start --model 282m.
+tokenize는 재개가 안 되므로(출력을 "wb"로 연다) tmux 안에서 끝까지 돌려야
+한다. data/prepare.py tokenizer는 절대 실행하지 않는다 — 어휘 16,384가
+바뀌면 모든 체크포인트가 무용지물이 된다.
+
+로컬 data/processed/train.bin은 2,677,510,268 토큰에서 중단된 상태로
+남아 있다. 서버에서 전량을 새로 만들므로 이제 쓰지 않는다.
+
+### 학습이 끝나면 (순서)
+
+1. train_detached.py status로 "학습 종료" 확인, fp16 스킵 스텝 수 확인
+2. 서버에서 sample.py로 먼저 생성해 본다. 손실은 떨어졌는데 생성이 안 되는
+   경우가 있으므로 3.2GB를 내려받기 전에 확인한다
+3. SFT를 서버에서 이어서 돌린다. 282M 학습은 가중치+기울기+Adam만 4.5GB라
+   로컬 6GB에 안 들어간다. 추론은 0.6GB라 여유롭다
+4. export_weights.py --half 후 로컬에서 scp로 pull (서버는 노트북에 접속
+   못 한다). 서버 자원이 회수될 수 있으면 best.pt(3.2GB)도 함께 받아둔다
+5. 로컬에서 eval/harness.py로 pass@k 측정
+
+체크포인트는 git에 올리지 않는다. GitHub 파일 상한이 100MB이고 .gitignore가
+이미 checkpoints/*를 막고 있다. 보관이 필요하면 GitHub Releases(파일당 2GB).
+
+### 남은 작은 문제
+
+export_weights.py --half이 임베딩 공유를 깨뜨린다. dtype 변환이 새 텐서를
+만들어 tok_emb.weight와 lm_head.weight가 파일에 두 번 저장된다(실측: 고유
+저장소 92 -> 93). 53M에서 20MB, 282M이면 약 34MB가 더 붙는다. 두 사본 값이
+같고 로드 시 묶인 파라미터에 둘 다 쓰이므로 정확도에는 영향이 없다.
+파일 크기만의 문제라 아직 안 고쳤다.
