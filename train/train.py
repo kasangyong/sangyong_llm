@@ -1,7 +1,7 @@
 """프리트레이닝 루프. 직접 구현.
 
 노트북 GPU에서 도는 것을 전제로 짰다:
-  - bf16 autocast (6GB에 53M 모델 + 옵티마이저 상태를 넣으려면 필수)
+  - 혼합정밀도 autocast (GPU에 맞춰 bf16/fp16 자동 선택 — model/precision.py)
   - 기울기 누적으로 유효 배치를 키운다
   - 매 N스텝 체크포인트. 중단은 사고가 아니라 기본 전제다.
 """
@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import torch
 
+from model.precision import autocast, label, needs_scaler
+from model.precision import resolve as resolve_precision
 from model.transformer import ModelConfig, Transformer
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,6 +68,9 @@ class TrainConfig:
     ckpt_interval: int = 250
 
     seed: int = 1337
+    # "auto"면 GPU에 맞춰 고른다(model/precision.py). Ampere 이상은 bf16,
+    # V100(sm_70)급은 fp16. 강제하려면 bf16 / fp16 / fp32.
+    precision: str = "auto"
     compile_model: bool = False  # Windows에서는 대체로 불안정하다
 
     @property
@@ -161,14 +166,16 @@ def make_optimizer(model: Transformer, cfg: TrainConfig):
 
 
 @torch.no_grad()
-def estimate_loss(model, datasets, cfg, device, generator=None):
+def estimate_loss(model, datasets, cfg, device, generator=None, amp_dtype=None):
+    if amp_dtype is None:
+        amp_dtype, _ = resolve_precision(device, getattr(cfg, "precision", "auto"))
     model.eval()
     out = {}
     for split, ds in datasets.items():
         losses = torch.zeros(cfg.eval_iters)
         for i in range(cfg.eval_iters):
             x, y = ds.batch(cfg.batch_size, device, generator)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
+            with autocast(amp_dtype):
                 _, loss, _ = model(x, targets=y)
             losses[i] = loss.item()
         out[split] = losses.mean().item()
@@ -176,20 +183,45 @@ def estimate_loss(model, datasets, cfg, device, generator=None):
     return out
 
 
-def save_checkpoint(path: Path, model, optimizer, mcfg, tcfg, it, best_val):
+def clip_and_step(scaler, optimizer, model, grad_clip: float):
+    """기울기를 자르고 한 스텝 밟는다. (gnorm, 실제로 밟았는지)를 돌려준다.
+
+    unscale_을 클리핑보다 **먼저** 불러야 한다. 순서가 바뀌면 손실 곡선에
+    아무 징후 없이 유효 학습률이 무너진다. 스케일된 기울기(노름이 scale배)를
+    grad_clip으로 자르니 1/scale에 가까운 계수가 곱해지고, 그 뒤 unscale_이
+    한 번 더 나누기 때문이다. 실측(scale 128, grad_clip 1.0): 실제 기울기
+    노름이 0.25 -> 0.0078로 32배 줄었다. 보고되는 gnorm은 반대로 128배
+    부풀려져서 로그만 봐서는 "기울기가 큰 구간"으로 읽힌다.
+
+    scaler가 꺼져 있으면(bf16/fp32) unscale_과 step은 그대로 통과한다.
+    """
+    scaler.unscale_(optimizer)
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # inf/nan이 섞인 스텝은 scaler가 건너뛰고 스케일을 낮춘다. 건너뛴 횟수를
+    # 세어두지 않으면 "학습은 도는데 진도가 안 나가는" 상태를 못 알아챈다.
+    scale_before = scaler.get_scale()
+    scaler.step(optimizer)
+    scaler.update()
+    stepped = not scaler.is_enabled() or scaler.get_scale() >= scale_before
+    return gnorm, stepped
+
+
+def save_checkpoint(path: Path, model, optimizer, mcfg, tcfg, it, best_val, scaler=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "model_config": asdict(mcfg),
-            "train_config": asdict(tcfg),
-            "iter": it,
-            "best_val": best_val,
-        },
-        tmp,
-    )
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "model_config": asdict(mcfg),
+        "train_config": asdict(tcfg),
+        "iter": it,
+        "best_val": best_val,
+    }
+    if scaler is not None and scaler.is_enabled():
+        # fp16 손실 스케일도 학습 상태다. 빠뜨리면 재개 직후 스케일이 초기값
+        # (65536)으로 되돌아가 몇 스텝이 오버플로로 버려지고 궤적이 어긋난다.
+        payload["scaler"] = scaler.state_dict()
+    torch.save(payload, tmp)
     tmp.replace(path)  # 저장 중 죽어도 기존 체크포인트가 안 깨지도록
 
 
@@ -208,6 +240,14 @@ def train(args):
         tcfg.batch_size = args.batch_size
     if args.grad_accum:
         tcfg.grad_accum = args.grad_accum
+    if args.precision:
+        tcfg.precision = args.precision
+
+    # 정밀도는 GPU 세대가 정한다. is_bf16_supported()는 V100에서도 True를
+    # 돌려주므로 근거로 쓸 수 없다 (model/precision.py에 실측치 있음).
+    amp_dtype, precision_why = resolve_precision(device, tcfg.precision)
+    tcfg.precision = label(amp_dtype)
+    scaler = torch.amp.GradScaler(device, enabled=needs_scaler(amp_dtype))
 
     torch.manual_seed(tcfg.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -246,6 +286,8 @@ def train(args):
         optimizer.load_state_dict(ck["optimizer"])
         start_iter = ck["iter"] + 1
         best_val = ck["best_val"]
+        if scaler.is_enabled() and "scaler" in ck:
+            scaler.load_state_dict(ck["scaler"])
         print(f"[resume] {resume_path.name}에서 iter {start_iter}부터 재개")
     else:
         model = Transformer(mcfg).to(device)
@@ -257,6 +299,7 @@ def train(args):
     print(f"어휘        : {vocab_size:,}")
     print(f"파라미터    : {n_params:,}")
     print(f"학습 토큰   : {len(train_ds):,} / 검증 {len(val_ds):,}")
+    print(f"정밀도      : {tcfg.precision} ({precision_why})")
     print(f"유효 배치   : {tcfg.tokens_per_iter:,} 토큰/스텝")
     print(f"스텝        : {tcfg.max_iters:,} (총 {tcfg.max_iters * tcfg.tokens_per_iter / 1e9:.2f}B 토큰)")
     print("=" * 60)
@@ -268,6 +311,9 @@ def train(args):
     # 마지막 로그 이후 지난 스텝 수. log_interval로 고정해서 나누면 첫 줄이
     # 10배 부풀려진 처리량을 보고한다 (그때는 1스텝만 지났으므로).
     iters_since_log = 0
+    # fp16에서 오버플로가 난 스텝은 scaler가 통째로 버린다. 몇 번 버려졌는지
+    # 세어두지 않으면 "돌긴 도는데 진도가 안 나가는" 상태를 못 알아챈다.
+    n_skipped = 0
 
     for it in range(start_iter, tcfg.max_iters):
         lr = lr_at(it, tcfg)
@@ -278,29 +324,37 @@ def train(args):
         total_loss = 0.0
         for _ in range(tcfg.grad_accum):
             x, y = train_ds.batch(tcfg.batch_size, device)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
+            with autocast(amp_dtype):
                 _, loss, _ = model(x, targets=y)
             # 누적 스텝 수로 나눠야 전체 배치 평균과 같아진다
-            (loss / tcfg.grad_accum).backward()
+            scaler.scale(loss / tcfg.grad_accum).backward()
             total_loss += loss.item() / tcfg.grad_accum
 
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
-        optimizer.step()
+        gnorm, stepped = clip_and_step(scaler, optimizer, model, tcfg.grad_clip)
+        if not stepped:
+            n_skipped += 1
         iters_since_log += 1
 
         if it % tcfg.log_interval == 0:
             dt = time.time() - t0
             tps = tcfg.tokens_per_iter * iters_since_log / max(dt, 1e-9)
             mem = torch.cuda.max_memory_allocated() / 1024**3 if device == "cuda" else 0
+            skip_note = f" | skip {n_skipped}" if n_skipped else ""
             print(
                 f"iter {it:6d} | loss {total_loss:.4f} | lr {lr:.2e} "
-                f"| gnorm {gnorm:.2f} | {tps:,.0f} tok/s | vram {mem:.2f}GB",
+                f"| gnorm {gnorm:.2f} | {tps:,.0f} tok/s | vram {mem:.2f}GB{skip_note}",
                 flush=True,
             )
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(
                     json.dumps(
-                        {"iter": it, "loss": total_loss, "lr": lr, "gnorm": float(gnorm)}
+                        {
+                            "iter": it,
+                            "loss": total_loss,
+                            "lr": lr,
+                            "gnorm": float(gnorm),
+                            "skipped": n_skipped,
+                        }
                     )
                     + "\n"
                 )
@@ -308,7 +362,7 @@ def train(args):
             iters_since_log = 0
 
         if it > 0 and it % tcfg.eval_interval == 0:
-            losses = estimate_loss(model, datasets, tcfg, device)
+            losses = estimate_loss(model, datasets, tcfg, device, amp_dtype=amp_dtype)
             ppl = math.exp(min(losses["val"], 20))
             print(
                 f"  [eval] iter {it} train {losses['train']:.4f} "
@@ -320,14 +374,22 @@ def train(args):
             if losses["val"] < best_val:
                 best_val = losses["val"]
                 save_checkpoint(
-                    CKPT_DIR / "best.pt", model, optimizer, mcfg, tcfg, it, best_val
+                    CKPT_DIR / "best.pt", model, optimizer, mcfg, tcfg, it, best_val,
+                    scaler=scaler,
                 )
 
         if it > 0 and it % tcfg.ckpt_interval == 0:
-            save_checkpoint(resume_path, model, optimizer, mcfg, tcfg, it, best_val)
+            save_checkpoint(
+                resume_path, model, optimizer, mcfg, tcfg, it, best_val, scaler=scaler
+            )
 
-    save_checkpoint(resume_path, model, optimizer, mcfg, tcfg, tcfg.max_iters - 1, best_val)
+    save_checkpoint(
+        resume_path, model, optimizer, mcfg, tcfg, tcfg.max_iters - 1, best_val,
+        scaler=scaler,
+    )
     print(f"\n학습 종료. best val loss = {best_val:.4f}")
+    if n_skipped:
+        print(f"fp16 오버플로로 건너뛴 스텝: {n_skipped:,} / {tcfg.max_iters - start_iter:,}")
 
 
 def main():
@@ -339,6 +401,10 @@ def main():
     ap.add_argument("--max-iters", type=int, default=None, help="직접 지정하면 epochs를 무시한다")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--grad-accum", type=int, default=None)
+    ap.add_argument(
+        "--precision", choices=("auto", "bf16", "fp16", "fp32"), default=None,
+        help="기본 auto — GPU 세대로 결정 (Ampere+ bf16 / V100급 fp16)",
+    )
     train(ap.parse_args())
 
 

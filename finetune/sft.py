@@ -23,9 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from finetune.dataset import SFTDataset
+from model.precision import autocast, label, needs_scaler
+from model.precision import resolve as resolve_precision
 from tokenizer.bpe import BPETokenizer
 from train.train import (
     TrainConfig,
+    clip_and_step,
     estimate_loss,
     load_checkpoint,
     lr_at,
@@ -85,11 +88,18 @@ def sft_loop(
     mcfg=None,
     ckpt_dir: Path | None = None,
     verbose: bool = True,
+    amp_dtype=None,
+    scaler=None,
 ) -> list[dict]:
     """SFT 스텝을 max_iters만큼 돈다. 스텝별 기록을 돌려준다.
 
     ckpt_dir가 None이면 아무것도 저장하지 않는다(테스트용 경로).
     """
+    if amp_dtype is None:
+        amp_dtype, _ = resolve_precision(device, getattr(cfg, "precision", "auto"))
+    if scaler is None:
+        scaler = torch.amp.GradScaler(device, enabled=needs_scaler(amp_dtype))
+
     train_ds = datasets["train"]
     history: list[dict] = []
     best_val = float("inf")
@@ -110,13 +120,12 @@ def sft_loop(
         total_loss = 0.0
         for _ in range(cfg.grad_accum):
             x, y = train_ds.batch(cfg.batch_size, device)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
+            with autocast(amp_dtype):
                 _, loss, _ = model(x, targets=y)
-            (loss / cfg.grad_accum).backward()
+            scaler.scale(loss / cfg.grad_accum).backward()
             total_loss += loss.item() / cfg.grad_accum
 
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        gnorm, _stepped = clip_and_step(scaler, optimizer, model, cfg.grad_clip)
         iters_since_log += 1
         history.append({"iter": it, "loss": total_loss, "lr": lr})
 
@@ -140,7 +149,7 @@ def sft_loop(
             # 이번 에포크의 학습 순회에서 빠진다(기본 설정에서 학습 draw의
             # 약 10%). 커서를 되돌려 놓는다.
             saved = train_ds.epoch_state()
-            losses = estimate_loss(model, datasets, cfg, device)
+            losses = estimate_loss(model, datasets, cfg, device, amp_dtype=amp_dtype)
             train_ds.restore_epoch_state(saved)
             if verbose:
                 print(
@@ -153,17 +162,20 @@ def sft_loop(
                 best_val = losses["val"]
                 if ckpt_dir and mcfg is not None:
                     save_checkpoint(
-                        ckpt_dir / "best.pt", model, optimizer, mcfg, cfg, it, best_val
+                        ckpt_dir / "best.pt", model, optimizer, mcfg, cfg, it, best_val,
+                        scaler=scaler,
                     )
 
         if ckpt_dir and mcfg is not None and it > 0 and it % cfg.ckpt_interval == 0:
             save_checkpoint(
-                ckpt_dir / "latest.pt", model, optimizer, mcfg, cfg, it, best_val
+                ckpt_dir / "latest.pt", model, optimizer, mcfg, cfg, it, best_val,
+                scaler=scaler,
             )
 
     if ckpt_dir and mcfg is not None:
         save_checkpoint(
-            ckpt_dir / "latest.pt", model, optimizer, mcfg, cfg, cfg.max_iters - 1, best_val
+            ckpt_dir / "latest.pt", model, optimizer, mcfg, cfg, cfg.max_iters - 1,
+            best_val, scaler=scaler,
         )
     return history
 
@@ -229,7 +241,7 @@ def run(args):
         )
 
     print("=" * 60)
-    print(f"장치        : {device}")
+    print(f"장치        : {device} / {label(resolve_precision(device, cfg.precision)[0])}")
     print(f"기반 체크포인트: {base_ckpt.name} (iter {ck.get('iter', -1)})")
     print(f"어휘        : {tok.vocab_size:,} (변경 없음)")
     print(f"학습 샘플   : {train_ds.stats.report()}")

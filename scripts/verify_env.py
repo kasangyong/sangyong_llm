@@ -1,19 +1,26 @@
 """0단계 환경 검증. 통과해야만 다음 단계로 넘어간다.
 
 단순히 cuda.is_available()을 믿지 않는다. 실제로 연산을 돌려서
-결과가 CPU와 일치하는지, bf16이 되는지, 학습에 쓸 메모리가
-실제로 확보되는지까지 확인한다.
+결과가 CPU와 일치하는지, 고른 정밀도가 fp32보다 실제로 빠른지, 학습에 쓸
+메모리가 실제로 확보되는지까지 확인한다.
 """
 
 import sys
+import time
 import traceback
+from pathlib import Path
 
 # Windows 콘솔 기본 코드페이지(cp949)에서 한글/기호가 깨지거나 죽는 것을 막는다.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import torch
 import torch.nn.functional as F
+
+from model.precision import label
+from model.precision import resolve as resolve_precision
 
 RESULTS = []
 
@@ -58,21 +65,58 @@ def c_matmul_correct():
     return f"max_abs_diff={diff:.2e}"
 
 
-def c_bf16():
-    """bf16 학습을 쓸 것이므로 실제로 되는지 본다."""
-    assert torch.cuda.is_bf16_supported(), "bf16 미지원"
-    x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-    y = (x @ x).float()
-    assert torch.isfinite(y).all(), "bf16 연산 결과에 NaN/Inf"
-    return "bf16 matmul OK"
+def _tflops(dtype, n=2048, warmup=5, iters=20):
+    """행렬곱 실효 성능. 이론값이 아니라 실측이다."""
+    a = torch.randn(n, n, device="cuda", dtype=dtype)
+    b = torch.randn(n, n, device="cuda", dtype=dtype)
+    for _ in range(warmup):
+        a @ b
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        a @ b
+    torch.cuda.synchronize()
+    return iters * 2 * n**3 / (time.perf_counter() - t0) / 1e12
+
+
+def c_precision():
+    """고른 정밀도가 fp32보다 실제로 빠른지 잰다.
+
+    is_bf16_supported()를 믿으면 안 된다. V100(sm_70)에서도 True를 반환하는데,
+    실측하면 bf16 10.0 / fp32 13.2 / fp16 88.8 TFLOPS로 bf16이 fp32보다도
+    느리다(에뮬레이션). 검증은 초록불인데 학습만 8분의 1 속도로 도는 상황을
+    여기서 막는다. 지원 여부가 아니라 속도를 판정 근거로 쓴다.
+    """
+    dtype, why = resolve_precision("cuda")
+    fp32 = _tflops(torch.float32)
+    chosen = _tflops(dtype) if dtype is not None else fp32
+
+    x = torch.randn(256, 256, device="cuda", dtype=dtype or torch.float32)
+    assert torch.isfinite((x @ x).float()).all(), f"{label(dtype)} 연산에 NaN/Inf"
+
+    if dtype is not None:
+        assert chosen > fp32 * 1.3, (
+            f"{label(dtype)} {chosen:.1f} TFLOPS가 fp32 {fp32:.1f} TFLOPS보다 "
+            "빠르지 않다. 텐서코어를 못 쓰고 있다 - 정밀도 선택이 틀렸다."
+        )
+    bf16_claim = torch.cuda.is_bf16_supported()
+    return (
+        f"{label(dtype)} {chosen:.1f} vs fp32 {fp32:.1f} TFLOPS "
+        f"(is_bf16_supported={bf16_claim}) | {why}"
+    )
 
 
 def c_sdpa():
     """어텐션에 F.scaled_dot_product_attention을 쓴다. GQA 형상으로 확인."""
     B, T, H, KV, D = 2, 128, 10, 2, 64
-    q = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, KV, T, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, KV, T, D, device="cuda", dtype=torch.bfloat16)
+    # 학습에서 실제로 쓸 dtype으로 확인한다. sm_70에는 flash 백엔드가 없어
+    # mem_efficient/math로 내려가는데, enable_gqa를 그 백엔드가 받는지는
+    # 실제로 돌려봐야 안다.
+    dtype, _ = resolve_precision("cuda")
+    dtype = dtype or torch.float32
+    q = torch.randn(B, H, T, D, device="cuda", dtype=dtype)
+    k = torch.randn(B, KV, T, D, device="cuda", dtype=dtype)
+    v = torch.randn(B, KV, T, D, device="cuda", dtype=dtype)
     out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
     assert out.shape == (B, H, T, D), f"형상 이상: {out.shape}"
     assert torch.isfinite(out.float()).all(), "SDPA 결과에 NaN/Inf"
@@ -124,7 +168,7 @@ def main():
     check("CUDA 사용 가능", c_available)
     check("GPU 정보", c_device_info)
     check("GPU 행렬곱 정확도", c_matmul_correct)
-    check("bf16 지원", c_bf16)
+    check("정밀도 선택 (실측)", c_precision)
     check("GQA causal SDPA", c_sdpa)
     check("autograd 역전파", c_autograd)
     check("가용 VRAM", c_free_memory)

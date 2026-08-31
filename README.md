@@ -16,6 +16,7 @@ GPU 서버나 Colab에서 돌리려면 [docs/SERVER_SETUP.md](docs/SERVER_SETUP.
 |---|---|
 | `tokenizer/bpe.py` | 바이트 단위 BPE. 학습/인코딩/디코딩/저장 |
 | `model/transformer.py` | RoPE, RMSNorm, GQA 어텐션, SwiGLU, KV 캐시 생성 |
+| `model/precision.py` | GPU 세대로 bf16/fp16 선택. `is_bf16_supported()`를 안 믿는다 |
 | `data/download.py` | codeparrot-clean 샤드 다운로드 |
 | `data/prepare.py` | 필터 → 토크나이저 학습 → 토큰화 (3단계) |
 | `train/train.py` | 프리트레이닝 루프 (bf16, 기울기 누적, 체크포인트) |
@@ -206,17 +207,24 @@ result = run_with_search(
 
 | 스위트 | 항목 수 | 무엇을 잡는가 |
 |---|---|---|
-| `verify_env.py` | 9 | GPU 행렬곱 정확도, bf16, GQA SDPA, 가용 VRAM |
+| `verify_env.py` | 9 | GPU 행렬곱 정확도, 정밀도 실측 TFLOPS, GQA SDPA, 가용 VRAM |
 | `test_tokenizer.py` | 13 | 적대적 입력 28종, 무작위 유니코드 1000건, 어휘 크기 불변 |
 | `test_model.py` | 14 | 인과 마스크 누설, RoPE 상대위치, KV 캐시 등가 |
-| `test_training.py` | 8 | 기울기 누적 등가, 단일배치 과적합, 재개 궤적 일치 |
+| `test_training.py` | 10 | 기울기 누적 등가, 단일배치 과적합, 재개 궤적, fp16 클리핑 순서 |
 | `test_eval.py` | 12 | 정답/오답 판별, `sys.exit(0)` 우회 차단 |
 | `test_sft.py` | 23 | 손실 마스킹 경계, 어휘 불변, 평가가 에포크를 갉아먹는지 |
-| `test_tools.py` | 47 | 파서 경계, 검색 오류 구분, 마커 위조, 컨텍스트 예산 |
+| `test_tools.py` | 48 | 파서 경계, 검색 오류 구분, 마커 위조, 컨텍스트 예산 |
 | `test_regress_correctness.py` | 7 | 적대적 검증에서 재현된 결함 7종의 회귀 고정 |
 
 특히 **인과 마스크 누설**은 손실 곡선만 봐서는 절대 못 잡는다. 뚫려
 있으면 손실은 예쁘게 떨어지지만 생성은 전혀 안 된다.
+
+**정밀도**도 같은 종류다. 학습 dtype은 GPU 세대가 정한다 — Ampere(sm_80)
+이상은 bf16, V100(sm_70)급은 fp16이다. `torch.cuda.is_bf16_supported()`는
+V100에서도 True를 반환하지만 그 bf16은 에뮬레이션이라 fp32보다도 느리다
+(실측 bf16 10.0 / fp32 13.2 / fp16 88.8 TFLOPS). 그래서 `verify_env.py`는
+지원 여부가 아니라 **실측 TFLOPS가 fp32보다 빠른지**를 판정 근거로 쓴다.
+근거는 `model/precision.py`에 적어뒀다.
 
 ## 실측치 (RTX 4050 Laptop 6GB)
 

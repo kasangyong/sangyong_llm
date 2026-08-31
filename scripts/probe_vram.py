@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
+from model.precision import autocast, label, needs_scaler
+from model.precision import resolve as resolve_precision
 from model.transformer import ModelConfig, Transformer
 from train.train import TrainConfig, make_optimizer
 
@@ -27,6 +29,8 @@ SAFE_FRAC = 0.85  # 이 비율을 넘으면 시스템 RAM 유출로 본다
 
 def probe(batch_size: int, block_size: int, vocab_size: int = 16384):
     """(안전 여부, peak GB, 스텝 초, 설명) 반환."""
+    amp_dtype, _ = resolve_precision("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler(amp_dtype))
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     try:
@@ -38,11 +42,15 @@ def probe(batch_size: int, block_size: int, vocab_size: int = 16384):
 
         def step():
             opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            # 본 학습과 같은 경로로 재야 한다. autocast dtype이나 GradScaler가
+            # 빠지면 여기서 고른 배치 크기가 실제 학습에서 안 맞는다.
+            with autocast(amp_dtype):
                 _, loss, _ = model(x, targets=y)
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
 
         # 워밍업 2회 (커널 컴파일 + 옵티마이저 상태 생성)
         for _ in range(2):
@@ -82,13 +90,17 @@ def main():
     TOTAL_GB = total / 1024**3
     print(f"VRAM: 가용 {free / 1024**3:.2f}GB / 전체 {TOTAL_GB:.2f}GB")
     print(f"안전선: {TOTAL_GB * SAFE_FRAC:.2f}GB (넘으면 시스템 RAM 유출)")
+    amp_dtype, why = resolve_precision("cuda")
+    print(f"정밀도: {label(amp_dtype)} ({why})")
     print(f"모델: {Transformer(ModelConfig()).num_params():,} 파라미터\n")
 
     print(f"{'batch':>6} {'peak':>9} {'초/스텝':>9} {'토큰/초':>10}  결과")
     print("-" * 62)
     best = None
     rows = []
-    for batch_size in (1, 2, 4, 6, 8):
+    # 32GB급 카드에서는 6GB 노트북용 상한(8)으로 최적점을 못 찾는다.
+    # 한 번 넘치면 아래 break가 멈추므로 위쪽을 넉넉히 열어둔다.
+    for batch_size in (1, 2, 4, 8, 12, 16, 24, 32, 48, 64):
         ok, peak, sec, detail = probe(batch_size, 1024)
         tps = batch_size * 1024 / sec if sec == sec and sec > 0 else float("nan")
         rows.append((batch_size, ok, peak, sec, tps))

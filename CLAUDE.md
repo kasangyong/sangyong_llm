@@ -57,6 +57,13 @@ forward는 시프트를 안 하고 dataset이 시프트하므로, 완성 첫 토
 자리를 살려야 "프롬프트를 다 읽고 코드를 시작하는" 전이를 배운다. 한 칸 더
 가리면 손실 곡선은 멀쩡한데 그 전이만 못 배운다.
 
+**V100에서 bf16은 fp32보다 느리다.** `torch.cuda.is_bf16_supported()`가
+sm_70에서도 True를 돌려주지만 텐서코어가 아니라 에뮬레이션이다(실측 bf16
+10.0 / fp32 13.2 / fp16 88.8 TFLOPS). 정밀도는 `model/precision.py`가
+compute capability로 고른다. fp16을 쓰면 기울기 클리핑이 반드시
+`scaler.unscale_()` 뒤에 와야 한다 — 순서가 바뀌면 유효 학습률이 스케일
+배수만큼 조용히 무너진다.
+
 **인과 마스크 누설은 손실 곡선으로 못 잡는다.** 뚫려 있으면 손실은 예쁘게
 떨어지고 생성만 안 된다. `tests/test_model.py`의 누설 테스트를 항상 통과시킬 것.
 
@@ -72,7 +79,7 @@ forward는 시프트를 안 하고 dataset이 시프트하므로, 완성 첫 토
 python scripts/run_tests.py
 ```
 
-8개 스위트 140항목. GPU가 학습으로 점유 중이면 `verify_env.py`의 가용 VRAM
+8개 스위트 136항목. GPU가 학습으로 점유 중이면 `verify_env.py`의 가용 VRAM
 검사가 걸릴 수 있는데, 그건 올바른 동작이다.
 
 ## 며칠짜리 학습

@@ -4,6 +4,7 @@
   - 기울기 누적을 잘못 나눠서 유효 학습률이 달라지는 것
   - 체크포인트에 옵티마이저 상태를 빠뜨려 재개 후 궤적이 튀는 것
   - 데이터 로더가 x/y 정렬을 틀려서 모델이 자기 입력을 베끼는 것
+  - fp16 GradScaler에서 unscale_과 기울기 클리핑의 순서가 뒤바뀌는 것
   - LR 스케줄이 워밍업/감쇠를 잘못 계산하는 것
 
 단일 배치 과적합 테스트가 핵심이다. 모델+옵티마이저+손실이 실제로
@@ -25,6 +26,7 @@ from model.transformer import ModelConfig, Transformer
 from train.train import (
     BinDataset,
     TrainConfig,
+    clip_and_step,
     load_checkpoint,
     lr_at,
     make_optimizer,
@@ -48,6 +50,82 @@ def check(name, fn):
     except Exception as e:
         RESULTS.append((False, name, f"{type(e).__name__}: {e}"))
         print(f"[FAIL] {name}: {type(e).__name__}: {e}")
+
+
+# ------------------------------------------------------- fp16 GradScaler
+
+def _true_grad_norm(model):
+    """클리핑 없이 현재 기울기 노름만 잰다."""
+    return float(torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")))
+
+
+def _fresh():
+    torch.manual_seed(0)
+    m = torch.nn.Linear(64, 64).to(DEVICE)
+    x = torch.randn(32, 64, device=DEVICE)
+    return m, x
+
+
+def c_clip_after_unscale():
+    """clip_and_step은 unscale_을 클리핑보다 먼저 불러야 한다.
+
+    순서가 뒤바뀌면 손실 곡선에 아무 징후 없이 유효 학습률이 무너진다.
+    스케일된 기울기(노름이 scale배)를 grad_clip으로 자르므로 1/scale에
+    가까운 계수가 곱해지고, 그 뒤 unscale_이 한 번 더 나눈다.
+    실측(scale 128, clip 1.0): 실제 노름 0.25 -> 0.0078로 32배 축소,
+    보고되는 gnorm은 반대로 128배 부풀려진다.
+    """
+    CLIP, SCALE = 0.1, 128.0
+
+    # 기준값: 스케일을 안 건 진짜 기울기 노름
+    m, x = _fresh()
+    (m(x) ** 2).mean().backward()
+    g_ref = _true_grad_norm(m)
+    assert g_ref > CLIP, f"기준 노름 {g_ref:.4f}이 clip {CLIP}보다 작아 테스트가 무의미하다"
+
+    m, x = _fresh()
+    opt = torch.optim.SGD(m.parameters(), lr=0.0)  # lr 0 -> 파라미터는 안 움직인다
+    scaler = torch.amp.GradScaler(DEVICE, enabled=True, init_scale=SCALE)
+    scaler.scale((m(x) ** 2).mean()).backward()
+    gnorm, stepped = clip_and_step(scaler, opt, m, CLIP)
+    after = _true_grad_norm(m)
+
+    assert stepped, "정상 스텝인데 건너뛴 것으로 보고됐다"
+    assert abs(float(gnorm) - g_ref) / g_ref < 0.01, (
+        f"보고 gnorm {float(gnorm):.4f} != 실제 {g_ref:.4f} "
+        f"({float(gnorm) / g_ref:.1f}배). unscale_이 클리핑보다 뒤에 있다."
+    )
+    assert abs(after - CLIP) / CLIP < 0.01, (
+        f"클리핑 후 노름이 {after:.4f}, 기대 {CLIP}. 유효 학습률이 {CLIP / after:.0f}배 무너진다."
+    )
+    return f"gnorm {float(gnorm):.4f} (실제 {g_ref:.4f}), 클리핑 후 {after:.4f}"
+
+
+def c_scaler_state_round_trip():
+    """fp16 손실 스케일도 체크포인트에 실려야 재개 궤적이 안 끊긴다."""
+    m, _ = _fresh()
+    opt = torch.optim.SGD(m.parameters(), lr=0.0)
+    scaler = torch.amp.GradScaler(DEVICE, enabled=True, init_scale=1024.0)
+    scaler.scale((m(torch.randn(8, 64, device=DEVICE)) ** 2).mean()).backward()
+    clip_and_step(scaler, opt, m, 1.0)
+    saved = scaler.get_scale()
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "ck.pt"
+        save_checkpoint(path, m, opt, TINY, TrainConfig(), it=1, best_val=0.5, scaler=scaler)
+        ck = torch.load(path, map_location=DEVICE, weights_only=False)
+        assert "scaler" in ck, "체크포인트에 scaler 상태가 없다"
+        restored = torch.amp.GradScaler(DEVICE, enabled=True)
+        restored.load_state_dict(ck["scaler"])
+    assert restored.get_scale() == saved, f"복원 스케일 {restored.get_scale()} != {saved}"
+
+    # scaler가 꺼져 있으면(bf16/fp32) 키 자체를 안 넣는다 - 기존 체크포인트와 호환
+    off = torch.amp.GradScaler(DEVICE, enabled=False)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "ck2.pt"
+        save_checkpoint(path, m, opt, TINY, TrainConfig(), it=1, best_val=0.5, scaler=off)
+        assert "scaler" not in torch.load(path, map_location=DEVICE, weights_only=False)
+    return f"scale {saved:.0f} 저장/복원 일치, 비활성 시 키 없음"
 
 
 # --------------------------------------------------------------- LR 스케줄
@@ -313,6 +391,8 @@ def main():
     print(f"3단계: 학습 루프 적대적 검증 (device={DEVICE})")
     print("=" * 60)
 
+    check("fp16 클리핑은 unscale 뒤에", c_clip_after_unscale)
+    check("scaler 상태 체크포인트 왕복", c_scaler_state_round_trip)
     check("LR 스케줄", c_lr_schedule)
     check("기울기 누적 == 통짜 배치", c_grad_accum_equivalence)
     check("단일 배치 과적합", c_overfit_single_batch)
