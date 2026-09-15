@@ -1,0 +1,120 @@
+{
+  "checkpoint_iter": 13000,
+  "k": 5,
+  "temperature": 0.6,
+  "n_problems": 10,
+  "syntax_valid_rate": 0.96,
+  "pass_at_k": 0.6,
+  "per_problem": [
+    {
+      "name": "add_two",
+      "solved": true,
+      "reasons": [
+        "assert",
+        "pass",
+        "syntax",
+        "pass",
+        "pass"
+      ]
+    },
+    {
+      "name": "is_even",
+      "solved": true,
+      "reasons": [
+        "pass",
+        "assert",
+        "pass",
+        "pass",
+        "pass"
+      ]
+    },
+    {
+      "name": "reverse_string",
+      "solved": false,
+      "reasons": [
+        "assert",
+        "syntax",
+        "assert",
+        "assert",
+        "assert"
+      ]
+    },
+    {
+      "name": "max_of_list",
+      "solved": true,
+      "reasons": [
+        "error",
+        "pass",
+        "error",
+        "error",
+        "error"
+      ]
+    },
+    {
+      "name": "count_vowels",
+      "solved": true,
+      "reasons": [
+        "assert",
+        "error",
+        "assert",
+        "pass",
+        "error"
+      ]
+    },
+    {
+      "name": "fizzbuzz",
+      "solved": false,
+      "reasons": [
+        "assert",
+        "assert",
+        "assert",
+        "error",
+        "assert"
+      ]
+    },
+    {
+      "name": "sum_list",
+      "solved": true,
+      "reasons": [
+        "assert",
+        "error",
+        "error",
+        "pass",
+        "error"
+      ]
+    },
+    {
+      "name": "unique_sorted",
+      "solved": false,
+      "reasons": [
+        "error",
+        "error",
+        "error",
+        "timeout",
+        "assert"
+      ]
+    },
+    {
+      "name": "factorial",
+      "solved": false,
+      "reasons": [
+        "timeout",
+        "assert",
+        "error",
+        "assert",
+        "assert"
+      ]
+    },
+    {
+      "name": "word_count",
+      "solved": true,
+      "reasons": [
+        "pass",
+        "error",
+        "pass",
+        "assert",
+        "pass"
+      ]
+    }
+  ]
+}
