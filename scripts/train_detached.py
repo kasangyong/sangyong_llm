@@ -180,7 +180,36 @@ def cmd_status(args):
             print(f"{name}: {p.stat().st_size / 1024**2:.1f} MB ({mt})")
 
 
+def _stop_watchdog() -> None:
+    """워치독을 먼저 재운다. 순서를 바꾸면 워치독이 방금 죽인 학습을 되살린다.
+
+    train_watchdog을 import하지 않고 파일 경로만 쓴다. 그쪽이 이 모듈을
+    import하고 있어서 서로 부르면 순환 import가 된다.
+    """
+    wd_pid_file = CKPT_DIR / "watchdog.pid"
+    if not wd_pid_file.exists():
+        return
+    try:
+        wd_pid = int(wd_pid_file.read_text().strip())
+    except ValueError:
+        return
+    if not _alive(wd_pid):
+        return
+    (CKPT_DIR / "watchdog.stop").write_text("stop")
+    if not IS_WINDOWS:
+        try:
+            os.kill(wd_pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for _ in range(40):
+        if not _alive(wd_pid):
+            break
+        time.sleep(0.5)
+    print(f"워치독(PID {wd_pid}) {'종료됨' if not _alive(wd_pid) else '종료 실패 - 직접 kill 할 것'}")
+
+
 def cmd_stop(args):
+    _stop_watchdog()
     pid = _read_pid()
     if pid is None or not _alive(pid):
         print("돌고 있는 학습이 없다.")
