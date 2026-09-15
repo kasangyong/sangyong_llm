@@ -22,6 +22,14 @@ checkpoints/*
 *.log
 eval/results*.json
 
+# 학습 기록은 예외로 둔다. 셋 합쳐 273KB이고, 이 저장소에서 "무슨 일이
+# 있었는지"를 되짚을 수 있는 유일한 증거다. 체크포인트와 달리 다시 만들 수
+# 없다 — 학습을 처음부터 다시 돌려야 나온다.
+!checkpoints/trainlog.jsonl
+!checkpoints/RESULT.txt
+!checkpoints/train_stdout.log
+!checkpoints/watchdog.log
+
 # tokenizer.json은 무시하지 않는다. 어휘 16,384가 모델 임베딩 크기와
 # 묶여 있어서, 다른 기계에서 다시 학습하면 체크포인트가 호환되지 않는다.
 # finetune/data/*.jsonl도 올린다(2MB). 코퍼스 없이 SFT를 바로 시험할 수 있다.

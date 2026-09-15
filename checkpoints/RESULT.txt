@@ -1,0 +1,10 @@
+결과   : 정상 종료
+시각   : 2026-09-15 18:15:19
+내용   : 학습이 끝까지 갔다.
+
+학습 로그 마지막 줄:
+  iter  13080 | loss 0.8385 | lr 6.00e-05 | gnorm 0.13 | 6,515 tok/s | vram 25.01GB
+  iter  13090 | loss 0.8049 | lr 6.00e-05 | gnorm 0.13 | 6,516 tok/s | vram 25.01GB
+  iter  13100 | loss 0.8270 | lr 6.00e-05 | gnorm 0.12 | 6,513 tok/s | vram 25.01GB
+  iter  13110 | loss 0.8125 | lr 6.00e-05 | gnorm 0.12 | 6,508 tok/s | vram 25.01GB
+  iter  13120 | loss 0.7711 | lr 6.00e-05 | gnorm 0.12 | 6,513 tok/s | vram 25.01GB
