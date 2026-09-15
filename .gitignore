@@ -33,3 +33,8 @@ eval/results*.json
 # tokenizer.json은 무시하지 않는다. 어휘 16,384가 모델 임베딩 크기와
 # 묶여 있어서, 다른 기계에서 다시 학습하면 체크포인트가 호환되지 않는다.
 # finetune/data/*.jsonl도 올린다(2MB). 코퍼스 없이 SFT를 바로 시험할 수 있다.
+
+# 주피터가 편집 중인 파일을 통째로 복사해 두는 자리. README를 열어보면
+# README-checkpoint.md가 생기는데, 본문과 내용이 겹치는 자동 저장본이라
+# 커밋하면 같은 문서가 두 벌이 된다.
+.ipynb_checkpoints/
