@@ -94,3 +94,23 @@ python scripts/train_detached.py status
 체크포인트는 모델 가중치뿐 아니라 옵티마이저 모멘텀과 스텝 수까지 저장한다.
 `--resume`으로 궤적이 끊기지 않고 이어진다(테스트로 확인: 재개 전후 손실
 차이 0.00e+00).
+
+띄울 때는 워치독을 통해 띄운다. 9/5 밤에 학습이 iter 5670에서 사라졌는데
+트레이스백도 OOM도 재부팅도 없었다. 원인을 못 찾았으므로 재발을 전제로 둔다.
+
+```bash
+python scripts/train_watchdog.py start --model 282m --batch-size 2 --grad-accum 128
+python scripts/train_watchdog.py status
+python scripts/train_watchdog.py stop     # 워치독만. 학습은 계속 돈다
+```
+
+워치독은 5분마다 보고, 프로세스가 사라졌거나 로그가 45분째 안 늘면
+`--resume`으로 다시 띄운다. 재시작하지 않는 경우가 셋 있다: 정상 종료
+문구를 찾았을 때, 15분 안에 죽기를 3회 반복할 때(설정 문제로 보고 손을
+뗀다), stop 요청이 있을 때. `train_detached.py stop`은 워치독을 먼저 재우고
+학습을 멈춘다 — 순서가 반대면 워치독이 방금 멈춘 학습을 되살린다.
+
+**좀비를 살아 있다고 보면 워치독이 무력화된다.** 학습은 워치독의 자식이고
+워치독은 `wait()`을 하지 않는다. `os.kill(pid, 0)`은 좀비에도 성공하므로
+프로세스 확인만으로는 죽은 학습이 영원히 "실행 중"으로 보인다. `_alive()`가
+`/proc/<pid>/stat`의 상태까지 본다.
