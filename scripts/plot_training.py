@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -42,14 +42,14 @@ THEMES = {
     ),
 }
 
-# 학습 이력. watchdog.log와 train_stdout.log의 [detached] 헤더에서 읽은 값이다.
-#   (시작 시각, 시작 iter, 죽은/끝난 iter)
+# 학습 이력. 시작 시각은 train_stdout.log의 [detached] 헤더, 사망 시각은
+# 그때 사람이 확인해 적어둔 값이다(로그에 스텝별 시각이 없어 추정하지 않는다).
+#   (시작 시각, 시작 iter, 끝 iter, 끝난 시각)
 RUNS = [
-    (datetime(2026, 8, 31, 16, 10, 35), 0, 5670),
-    (datetime(2026, 9, 6, 22, 21, 5), 5501, 11860),
-    (datetime(2026, 9, 14, 11, 30, 18), 11751, 13120),
+    (datetime(2026, 8, 31, 16, 10, 35), 0, 5670, datetime(2026, 9, 5, 22, 57)),
+    (datetime(2026, 9, 6, 22, 21, 5), 5501, 11860, datetime(2026, 9, 12, 20, 45)),
+    (datetime(2026, 9, 14, 11, 30, 18), 11751, 13120, datetime(2026, 9, 15, 18, 15, 19)),
 ]
-RUN_END = datetime(2026, 9, 15, 18, 15, 19)
 
 
 def load():
@@ -168,25 +168,21 @@ def fig_schedule(train, t, path):
 def fig_timeline(t, path):
     """벽시계 대비 진행 스텝. 학습이 두 번 죽었고 얼마를 잃었는지 보여준다.
 
-    구간 안의 기울기는 실측 처리량으로 그린다. 로그에 스텝별 시각이 없어서,
-    시작 시각/시작 스텝/끝 스텝 세 앵커 사이를 일정 속도로 잇는다. 처리량이
-    전 구간 6,505~6,524 tok/s로 평평했으므로 이 근사는 안전하다.
+    구간의 양끝은 기록된 시각이고 그 사이는 직선으로 잇는다. 처리량이 전
+    구간 6,505~6,524 tok/s로 평평했으므로 직선 근사가 실제와 거의 같다.
     """
     fig, ax = plt.subplots(figsize=(9.2, 4.0), facecolor=t["surface"])
 
-    sec_per_iter = (RUN_END - RUNS[2][0]).total_seconds() / (RUNS[2][2] - RUNS[2][1])
-    wall = (RUN_END - RUNS[0][0]).total_seconds() / 86400
-    computed = sum(i1 - i0 for _, i0, i1 in RUNS)   # 되감긴 스텝은 두 번 계산된다
-    compute = computed * sec_per_iter / 86400
-    ends = []
-    for i, (start, i0, i1) in enumerate(RUNS):
-        end = start + timedelta(seconds=(i1 - i0) * sec_per_iter)
-        ends.append(end)
+    wall = (RUNS[-1][3] - RUNS[0][0]).total_seconds() / 86400
+    computed = sum(i1 - i0 for _, i0, i1, _ in RUNS)  # 되감긴 스텝은 두 번 센다
+    compute = sum((e - s).total_seconds() for s, _, _, e in RUNS) / 86400
+    ends = [end for _, _, _, end in RUNS]
+    for i, (start, i0, i1, end) in enumerate(RUNS):
         ax.plot([start, end], [i0, i1], color=t["s1"], linewidth=2.6,
                 solid_capstyle="round", zorder=3,
                 label="학습 진행" if i == 0 else None)
 
-    for (end, (nstart, ni0, _)) in zip(ends, RUNS[1:]):
+    for (end, (nstart, ni0, _, _)) in zip(ends, RUNS[1:]):
         # 죽은 지점에서 재개 지점까지. 세로 낙차가 되돌아간 스텝이다.
         ax.plot([end, nstart], [0, 0], color=t["surface"], linewidth=0)
         ax.axvspan(end, nstart, color=t["s2"], alpha=0.13, zorder=1)
@@ -196,7 +192,7 @@ def fig_timeline(t, path):
             ha="center", rotation=90, va="bottom",
         )
 
-    for end, (_, ni0, _), (_, _, pi1) in zip(ends, RUNS[1:], RUNS[:-1]):
+    for end, (_, ni0, _, _), (_, _, pi1, _) in zip(ends, RUNS[1:], RUNS[:-1]):
         ax.annotate(
             f"{pi1:,}에서 죽고\n{ni0:,}로 되감김 (−{pi1 - ni0})",
             xy=(end, pi1), xytext=(-10, 26), textcoords="offset points",
@@ -211,8 +207,8 @@ def fig_timeline(t, path):
     style(ax, t, "", "진행 스텝",
           f"벽시계 {wall:.1f}일, 실제 계산 {compute:.1f}일 — 두 번 죽었다")
     print(f"  벽시계 {wall:.2f}일 / 계산 {compute:.2f}일 / "
-          f"{sec_per_iter:.1f}초·스텝 / 중복 계산 {computed - RUNS[-1][2]:,}스텝")
-    for end, (nstart, _, _) in zip(ends, RUNS[1:]):
+          f"중복 계산 {computed - RUNS[-1][2]:,}스텝")
+    for end, (nstart, _, _, _) in zip(ends, RUNS[1:]):
         print(f"  정지 {end:%m-%d %H:%M} -> {nstart:%m-%d %H:%M} "
               f"({(nstart - end).total_seconds() / 3600:.1f}시간)")
     fig.tight_layout()
