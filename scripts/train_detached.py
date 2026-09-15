@@ -48,7 +48,14 @@ def _alive(pid: int) -> bool:
             return False
         except PermissionError:
             return True  # 남의 프로세스지만 살아 있다
-        return True
+        # 좀비는 신호 0에 응답한다. 워치독은 학습을 자식으로 띄우므로, 죽은
+        # 학습이 거둬지기 전까지 좀비로 남아 "실행 중"으로 보인다. 상태까지
+        # 봐야 죽은 걸 죽었다고 판정한다.
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            return stat.rsplit(") ", 1)[1].split(" ", 1)[0] != "Z"
+        except (OSError, IndexError):
+            return True
     out = subprocess.run(
         ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
         capture_output=True,
