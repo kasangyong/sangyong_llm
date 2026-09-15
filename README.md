@@ -1,226 +1,264 @@
 # sangyong_llm
 
-파이썬 코드를 생성하는 53M 파라미터 트랜스포머. 밑바닥부터 직접 구현.
+파이썬 코드를 생성하는 **282M 파라미터 트랜스포머**를 밑바닥부터 구현하고,
+V100S 한 장으로 **69억 토큰**을 완주시킨 기록이다.
 
 PyTorch에서 빌려 쓰는 것은 텐서 연산 / autograd / CUDA / 융합 어텐션 커널
 네 가지뿐이다. 토크나이저, 어텐션, RoPE, RMSNorm, 학습 루프, 데이터
-파이프라인, 평가 채점기는 전부 직접 작성했다. `transformers`,
-`tokenizers`, `datasets` 라이브러리는 쓰지 않는다.
+파이프라인, 평가 채점기, 재시작 워치독은 전부 직접 작성했다.
+`transformers`, `tokenizers`, `datasets`, `accelerate`, `peft`는 쓰지 않는다.
 
-설계 근거와 시행착오는 [docs/design/2026-08-13-sangyong-llm-design.md](docs/design/2026-08-13-sangyong-llm-design.md)에 있다.
-GPU 서버나 Colab에서 돌리려면 [docs/SERVER_SETUP.md](docs/SERVER_SETUP.md)를 본다.
+## 결과
 
-## 구성
+2026-08-31 ~ 2026-09-15, Tesla V100S-PCIE-32GB 한 장.
 
-| 경로 | 역할 |
+| 항목 | 값 |
 |---|---|
-| `tokenizer/bpe.py` | 바이트 단위 BPE. 학습/인코딩/디코딩/저장 |
-| `model/transformer.py` | RoPE, RMSNorm, GQA 어텐션, SwiGLU, KV 캐시 생성 |
-| `model/precision.py` | GPU 세대로 bf16/fp16 선택. `is_bf16_supported()`를 안 믿는다 |
-| `data/download.py` | codeparrot-clean 샤드 다운로드 |
-| `data/prepare.py` | 필터 → 토크나이저 학습 → 토큰화 (3단계) |
-| `train/train.py` | 프리트레이닝 루프 (bf16, 기울기 누적, 체크포인트) |
-| `train/sample.py` | 학습된 모델로 코드 생성 |
-| `eval/harness.py` | 문법 유효율 + pass@k 채점 |
-| `finetune/make_dataset.py` | 코퍼스에서 (독스트링 → 함수) 지시-응답 쌍 추출 |
-| `finetune/format.py` | `### 지시:` / `### 코드:` 프롬프트 포맷 |
-| `finetune/dataset.py` | SFT 데이터셋. 프롬프트 구간 손실 마스킹, 에포크 순회 |
-| `finetune/sft.py` | 인스트럭션 튜닝 루프 (프리트레이닝 lr의 1/10) |
-| `tools/protocol.py` | `### 검색:` 툴 호출 파싱, 검색 결과 컨텍스트 포맷 |
-| `tools/search.py` | Brave / Tavily / Serper 클라이언트 |
-| `tools/pipeline.py` | 생성 → 툴 호출 → 검색 → 재주입 루프 |
-| `scripts/verify_env.py` | GPU/CUDA 환경 검증 |
-| `scripts/verify_tokenizer.py` | 실전 토크나이저를 held-out 코퍼스로 검증 |
-| `scripts/probe_vram.py` | 안전한 batch_size 실측 (시스템 RAM 유출 탐지) |
-| `scripts/train_detached.py` | 학습을 세션과 분리해 실행 / 상태 확인 / 중단 |
-| `scripts/run_tests.py` | 전체 검증 일괄 실행 |
+| 파라미터 | **282,641,408** |
+| 학습 토큰 | **6,879,527,547** (1에포크, 13,121스텝) |
+| 최종 학습 손실 | 0.7711 (iter 13,120) |
+| **최저 검증 손실** | **0.8190** (iter 13,000) |
+| 검증 퍼플렉시티 | **2.268** |
+| 문법 유효율 | **96.0%** (48/50) |
+| **pass@5** | **60.0%** (6/10) |
+| 샘플 단위 통과율 | 26.0% (13/50) |
+| 처리량 | 6,513 tok/s (80.9초/스텝) |
+| 피크 VRAM | 25.01 GB / 32 GB |
+| 벽시계 | 15.1일 (실제 계산 12.5일) |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/training-curve-dark.png">
+  <img alt="학습·검증 손실 곡선" src="docs/assets/training-curve-light.png">
+</picture>
+
+검증 손실은 13,000스텝까지 단조롭게 떨어졌고 과적합으로 꺾이지 않았다.
+1에포크를 채워서 끝난 것이지 수렴해서 끝난 것이 아니다. 데이터를 더 넣으면
+더 내려갈 자리가 남아 있다.
+
+곡선이 iter 4,000·11,000 근처에서 잠깐 되튀는 것은 실제 성능 변화가 아니라
+**검증 배치 샘플링에 시드를 안 박아서 생긴 잡음**이다. 평가마다 다른 배치를
+뽑는다. SFT를 시작하기 전에 고정해야 한다.
+
+## 무엇을 직접 만들었나
+
+| 만든 것 | 빌린 것 |
+|---|---|
+| 바이트 단위 BPE (학습·인코딩·디코딩·직렬화) | `torch.Tensor`, autograd |
+| RoPE, RMSNorm, GQA 어텐션, SwiGLU | CUDA 런타임 |
+| KV 캐시 증분 생성 | `F.scaled_dot_product_attention` (융합 커널) |
+| 데이터 필터·중복 제거·토큰화 파이프라인 | `torch.optim.AdamW`, `GradScaler` |
+| 학습 루프(기울기 누적·체크포인트·재개) | |
+| 정밀도 선택(실측 TFLOPS 기반) | |
+| 평가 채점기(문법·pass@k·격리 실행) | |
+| SFT 데이터셋·손실 마스킹·튜닝 루프 | |
+| 검색 툴 호출 프로토콜·파이프라인 | |
+| 분리 실행 런처·재시작 워치독 | |
+
+코드 5,119줄 + 테스트 3,481줄.
 
 ## 모델
 
-크기는 GPU가 정한다. `model/transformer.py`의 프리셋을 `--model`로 고른다.
+```
+             282m                         53m
+d_model      1024                         640
+layers       24                           10
+heads        16 (KV 4, GQA 4:1)           10 (KV 2, GQA 5:1)
+d_ff         2752 (SwiGLU)                1728 (SwiGLU)
+context      2048                         1024
+파라미터      282,641,408                  53,507,200
+기준 HW      V100S 32GB                   RTX 4050 Laptop 6GB
+```
 
-| 항목 | `53m` (기본) | `282m` |
+- **위치 인코딩**: RoPE. 학습 가능한 위치 임베딩이 없다.
+- **정규화**: RMSNorm (pre-norm). LayerNorm의 평균 빼기를 생략한다.
+- **어텐션**: GQA. 282m은 Q 16헤드에 KV 4헤드를 공유해 KV 캐시를 1/4로 줄인다.
+- **FFN**: SwiGLU. `w_down(silu(w_gate(x)) * w_up(x))`, bias 없음.
+- **어휘**: 16,384 — 프리셋이 정하지 않고 항상 `tokenizer/tokenizer.json`에서
+  읽는다. 어휘가 바뀌면 임베딩 크기가 달라져 기존 체크포인트가 전부
+  무용지물이 되기 때문이다.
+
+`282m`의 크기는 취향이 아니라 계산이다. 6.88B 토큰의 Chinchilla 최적치가
+약 330M이고, 같은 데이터를 53M에 쓰면 6배 과잉이라 수익이 크게 체감된다.
+
+## 데이터
+
+`codeparrot/codeparrot-clean` 54샤드(12.2 GB 압축)에서 출발한다.
+
+```
+원본 문서    5,361,373
+  라이선스 탈락  -2,020,123     비허용/불명 라이선스
+  문법 탈락        -466,624     ast.parse 실패
+  크기 탈락          -6,287     너무 짧거나 너무 긺
+중복 제거             -0        해시 기준 중복 없음
+──────────────────────────
+유지         2,868,339 (53.5%) / 24.24 GB
+```
+
+토큰화하면 **train 6,879,527,547 / val 13,756,746 토큰**이다
+(`train.bin` 13.1 GB, `val.bin` 26.2 MB, uint16 평면 배열).
+
+토크나이저는 바이트 단위 BPE, 병합 16,127개 + 특수 토큰 1개 = 어휘 16,384.
+압축률 3.763 바이트/토큰. 96코어에서 92워커로 병렬 토큰화했다.
+
+라이선스 탈락이 전체의 38%로 가장 크다. 데이터가 모자라서가 아니라 쓸 수
+있는 것만 쓰겠다는 판단이고, 그 대가로 원본의 절반을 버렸다.
+
+## 학습
+
+```bash
+python scripts/train_watchdog.py start --model 282m --batch-size 2 --grad-accum 128
+```
+
+| 항목 | 값 | 근거 |
 |---|---|---|
-| 파라미터 | 53,507,200 | 282,641,408 |
-| d_model / layers / heads | 640 / 10 / 10 | 1024 / 24 / 16 |
-| KV heads (GQA) | 2 | 4 |
-| FFN | SwiGLU, d_ff 1728 | SwiGLU, d_ff 2752 |
-| context | 1,024 | 2,048 |
-| 기준 하드웨어 | RTX 4050 6GB | V100S 32GB |
+| 정밀도 | fp16 + GradScaler | V100은 sm_70. bf16 텐서코어가 없다 |
+| 옵티마이저 | AdamW (0.9, 0.95) | |
+| weight decay | 0.1 | 노름·바이어스는 제외 |
+| 학습률 | 6e-4 | 500스텝 워밍업 → 코사인 → 6e-5 |
+| 기울기 클리핑 | 1.0 | `scaler.unscale_()` **뒤에** 적용 |
+| 배치 | 2 × 누적 128 × 2048 = **524,288 토큰/스텝** | 32GB에서 역산 |
+| 스텝 | 13,121 (1에포크) | `train.bin` 크기에서 자동 계산 |
+| 평가 주기 | 1,000스텝 | |
 
-`53m`은 순전히 노트북 6GB 상한에서 역산한 크기다. `282m`은 6.6B 토큰의
-Chinchilla 최적치(약 330M)에 맞춘 것으로, 같은 데이터를 53M에 쓰면 6배
-과잉이라 수익이 크게 체감된다.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/lr-gnorm-dark.png">
+  <img alt="학습률 스케줄과 기울기 노름" src="docs/assets/lr-gnorm-light.png">
+</picture>
 
-vocab은 두 프리셋 공통 **16,384**이며 프리셋이 정하지 않는다. 항상
-`tokenizer/tokenizer.json`에서 읽는다 — 어휘가 바뀌면 임베딩 크기가 달라져
-기존 체크포인트가 전부 무용지물이 되기 때문이다.
+기울기 노름은 워밍업이 끝나는 iter 480에서 **292.6**까지 튀었고 손실도 5.74로
+같이 튀었다. 클리핑 한계 1.0이 이걸 잘라냈고 1,500스텝 안에 0.13 근방으로
+돌아와 끝까지 평평했다. 전 구간에서 **fp16 스케일러가 건너뛴 스텝은 0회**다.
 
-```bash
-python train/train.py --model 282m
-```
+### fp16을 고른 이유
 
-## 실행
+`torch.cuda.is_bf16_supported()`는 V100에서도 `True`를 반환한다. 그 bf16은
+텐서코어가 아니라 에뮬레이션이라 fp32보다도 느리다.
 
-환경은 Python 3.12 venv + PyTorch cu128을 쓴다. Python 3.14에는 CUDA
-휠이 없다.
+| 정밀도 | 실측 TFLOPS |
+|---|---|
+| bf16 | 10.0 |
+| fp32 | 13.2 |
+| **fp16** | **88.8** |
 
-```bash
-uv venv --python 3.12 .venv
-uv pip install torch numpy pyarrow huggingface_hub --index-url https://download.pytorch.org/whl/cu128
-```
+그래서 `scripts/verify_env.py`는 "지원하는가"가 아니라 **"실측 TFLOPS가
+fp32보다 빠른가"**를 판정 근거로 쓴다. 지원 여부만 믿었다면 8.9배 느리게
+돌았을 것이다.
 
-전체 검증부터 돌린다. 통과하지 않으면 다음으로 넘어가지 않는다.
+fp16을 쓰면 클리핑 순서가 걸린다. `scaler.unscale_()` **전에** 클리핑하면
+스케일된 기울기를 1.0으로 자르고 그 뒤 다시 나누게 되어, 유효 학습률이
+스케일 배수만큼 조용히 무너진다. 손실 곡선은 멀쩡해 보인다.
 
-```bash
-.venv/Scripts/python.exe scripts/run_tests.py
-```
+## 16일 동안 무슨 일이 있었나
 
-데이터를 준비한다. 샤드 8개면 약 1B 토큰, 전량(54개)이면 약 6.6B 토큰이다.
-`filter`는 이미 처리한 샤드를 건너뛰므로 나눠서 받아도 된다.
+학습은 **두 번 죽었다.** 트레이스백도 OOM도 재부팅 기록도 없었다.
 
-```bash
-.venv/Scripts/python.exe data/download.py --shards 54
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/timeline-dark.png">
+  <img alt="벽시계 대비 진행 스텝" src="docs/assets/timeline-light.png">
+</picture>
 
-```bash
-.venv/Scripts/python.exe data/prepare.py filter
-```
+| | 죽은 지점 | 재개 지점 | 되감김 | 멈춰 있던 시간 |
+|---|---|---|---|---|
+| 1차 | iter 5,670 | 5,501 | −169 | 22.8시간 |
+| 2차 | iter 11,860 | 11,751 | −109 | 38.3시간 |
 
-```bash
-.venv/Scripts/python.exe data/prepare.py tokenizer --sample-mb 100
-```
+원인을 특정하지 못했으므로 **재발을 전제로** `scripts/train_watchdog.py`를
+만들었다. 5분마다 보고, 프로세스가 사라졌거나 로그가 45분째 안 늘면
+`--resume`으로 다시 띄운다. 재시작하지 **않는** 경우가 셋 있다.
 
-```bash
-.venv/Scripts/python.exe data/prepare.py tokenize
-```
+- 로그에 정상 종료 문구가 있을 때
+- 15분 안에 죽기를 3회 반복할 때 (설정 문제로 보고 손을 뗀다)
+- `stop` 요청이 있을 때 (사람이 일부러 멈춘 학습을 되살리면 안 된다)
 
-학습한다. 스텝 수는 `train.bin` 크기와 `--epochs`로 자동 계산된다.
+2차 사망은 워치독을 껐던 구간에 일어났다. 워치독 정지가 9/12 20:47,
+추정 사망이 9/12 21:11 — 24분 차이로 감시가 비어 있었고 38시간을 잃었다.
+워치독이 붙어 있었으면 5분이면 됐다.
 
-며칠 걸리는 작업이므로 터미널·세션과 분리해서 띄운다. 부모에 묶여 있으면
-창을 닫거나 접속이 끊길 때 같이 죽는다.
+되감김이 생기는 것은 체크포인트를 1,000스텝마다 쓰기 때문이다. 두 번 합쳐
+**278스텝을 다시 계산**했다. 벽시계 15.1일 중 실제 계산은 12.5일이고,
+나머지 2.5일은 죽은 채로 서 있었다.
 
-```bash
-.venv/Scripts/python.exe scripts/train_detached.py start
-```
+**함정 하나.** 학습은 워치독의 자식 프로세스인데 워치독은 `wait()`을 하지
+않는다. `os.kill(pid, 0)`은 좀비에도 성공하므로, PID 확인만 하면 죽은 학습이
+영원히 "실행 중"으로 보여 워치독이 무력화된다. `_alive()`가
+`/proc/<pid>/stat`의 상태 문자까지 본다.
 
-```bash
-.venv/Scripts/python.exe scripts/train_detached.py status
-```
-
-```bash
-.venv/Scripts/python.exe scripts/train_detached.py stop
-```
-
-중단한 뒤에는 `--resume`으로 이어진다. 모델 가중치뿐 아니라 옵티마이저
-모멘텀과 스텝 수까지 복원하므로 궤적이 끊기지 않는다.
-
-```bash
-.venv/Scripts/python.exe scripts/train_detached.py start --resume
-```
-
-노트북이 절전에 들어가면 학습도 멈췄다가 깨어날 때 이어진다. 데이터는
-망가지지 않지만 벽시계 시간이 그만큼 늘어난다. 며칠 돌릴 거면 전원 설정에서
-절전을 꺼두는 편이 낫다.
-
-생성해 본다.
+## 평가
 
 ```bash
-.venv/Scripts/python.exe train/sample.py --prompt "def quicksort(xs):" --num-samples 3
+python eval/harness.py --ckpt checkpoints/best.pt --k 5
 ```
 
-채점한다.
+문제 10개를 각각 5번 생성해 별도 프로세스에서 실행하고 채점한다.
+
+| | |
+|---|---|
+| 문법 유효율 | **96.0%** (48/50) |
+| pass@5 | **60.0%** (6/10) |
+| 샘플 단위 통과율 | 26.0% (13/50) |
+
+| 문제 | pass@5 | 5회 결과 |
+|---|---|---|
+| `add_two` | 통과 | assert, **pass**, syntax, **pass**, **pass** |
+| `is_even` | 통과 | **pass**, assert, **pass**, **pass**, **pass** |
+| `reverse_string` | 실패 | assert, syntax, assert, assert, assert |
+| `max_of_list` | 통과 | error, **pass**, error, error, error |
+| `count_vowels` | 통과 | assert, error, assert, **pass**, error |
+| `fizzbuzz` | 실패 | assert, assert, assert, error, assert |
+| `sum_list` | 통과 | assert, error, error, **pass**, error |
+| `unique_sorted` | 실패 | error, error, error, timeout, assert |
+| `factorial` | 실패 | timeout, assert, error, assert, assert |
+| `word_count` | 통과 | **pass**, error, **pass**, assert, **pass** |
+
+50회 중 실패 사유: 단언 불일치 18, 실행 오류 15, 문법 오류 2, 타임아웃 2.
+
+**문법은 거의 다 맞고 의미가 자주 틀린다.** 파이썬의 형태는 배웠지만
+"무엇을 계산하라고 했는지"는 절반쯤만 따라온다. 282M / 6.9B 토큰에서 나올
+만한 자리다.
+
+채점기는 종료코드만 보지 않는다. 생성 코드가 `sys.exit(0)`을 부르면 테스트를
+건너뛰고 0을 반환하므로 센티넬 출력을 확인한다.
+
+### 실제 생성
 
 ```bash
-.venv/Scripts/python.exe eval/harness.py --ckpt checkpoints/best.pt --k 5
+python train/sample.py --ckpt checkpoints/best.pt \
+  --prompt 'def flatten(nested):
+    """Flatten a nested list into a single flat list."""
+' --temperature 0.6
 ```
-
-## 인스트럭션 튜닝 (SFT)
-
-**프리트레이닝이 아직 안 끝나서 실제 SFT는 못 돌린다.** `--base`가 가리키는
-`checkpoints/best.pt`가 없으면 시작하지 않는다. 아래는 기반 모델이 나온 뒤의
-절차이고, 지금 검증된 것은 데이터셋 생성과 학습 루프의 동작뿐이다(CPU 초소형
-모델로 확인).
-
-데이터셋은 필터링된 코퍼스에서 (독스트링 → 함수 본문) 쌍을 뽑아 만든다.
-현재 `finetune/data/`에 train 2,845 / val 155 샘플이 들어 있다.
-
-```bash
-.venv/Scripts/python.exe finetune/make_dataset.py build --target 5000
-```
-
-```bash
-.venv/Scripts/python.exe finetune/make_dataset.py peek --n 3
-```
-
-```bash
-.venv/Scripts/python.exe finetune/sft.py --base checkpoints/best.pt
-```
-
-포맷은 특수 토큰 없이 일반 텍스트 마커를 쓴다. 어휘 16,384는 프리트레이닝과
-동일해야 하므로 SFT는 토크나이저를 건드리지 않는다. 어휘가 어긋나면 시작
-시점에 멈춘다.
-
-```
-### 지시:
-<지시문>
-
-### 코드:
-<코드>
-```
-
-손실은 `### 코드:` 뒤 완성 구간에서만 계산한다. 프롬프트 구간과 패딩은
-라벨 -1로 마스킹한다.
-
-기본 저장 경로는 `checkpoints/sft/`다. `--out-dir`로 `checkpoints/`를 직접
-주면 거부한다 — `latest.pt`를 덮어써 프리트레이닝을 날리기 때문이다.
-
-## 검색/툴 레이어
-
-**실제 검색에는 API 키가 필요하다.** 키가 없으면 `MissingAPIKeyError`로
-멈춘다. 제공자별 환경변수는 `BRAVE_SEARCH_API_KEY`(또는 `BRAVE_API_KEY`),
-`TAVILY_API_KEY`, `SERPER_API_KEY`다. 테스트는 HTTP 함수를 주입해 돌리므로
-키도 네트워크도 쓰지 않는다.
-
-툴 호출은 줄 머리의 한 줄짜리 마커다. 닫을 것이 없어 53M 모델이 배우기
-쉽고, `### 지시:`와 같은 모양이다.
-
-```
-### 검색: <질의>
-### 검색결과:
-[1] 제목 (url)
-    스니펫
-### 답변:
-```
-
-라이브러리로만 제공한다. CLI는 없다.
 
 ```python
-from tools.pipeline import run_with_search
-from tools.search import make_client
+def flatten(nested):
+    """Flatten a nested list into a single flat list."""
+    return [item for sublist in nested for item in sublist]
 
-client = make_client("brave")            # 키 없으면 여기서 예외
-result = run_with_search(
-    prompt,
-    generate=my_generate,                # generate(prompt) -> str
-    search=client.search,                # search(query) -> list[SearchResult]
-    max_calls=2,
-    max_context=cfg.max_seq_len - max_new_tokens,
-)
+
+def flatten_entities(entities):
+    """Flatten a list of entities into a single flat list."""
+    return [entity for entity in entities if entity]
+
+
+def flatten_list_of_dicts(list_of_dicts):
+    """Flatten a list of dicts into a single flat list."""
+    return [dict(zip(flatten_entities(list_of_dicts[0]), ...
 ```
 
-`max_context`를 안 주면 프롬프트가 라운드마다 누적되어 2~3라운드에서
-`max_seq_len`(1,024)을 넘긴다. 자리가 없으면 검색을 쏘기 전에
-`stop_reason="context_full"`로 멈춘다.
+첫 함수는 맞다. 그다음부터가 이 모델의 전형적인 실패 방식이다 — 멈추지 않고
+**비슷한 이름의 함수를 계속 찍어낸다.** 프리트레이닝만 한 기반 모델이라
+"요청을 하나 끝내고 멈춘다"를 배운 적이 없다. SFT가 필요한 지점이 여기다.
 
-검색 결과는 신뢰하지 않는다. 스니펫/제목/URL이 줄 머리에 마커를 만들면
-앞에 공백을 넣어 무력화한다. 안 그러면 검색 제공자가 다음 질의를 고른다.
+한국어 프롬프트는 잘 못 따라온다. 코퍼스가 영어 파이썬 코드라 당연한 결과다.
 
-## 검증 원칙
+## 검증
 
-각 단계는 먼저 깨뜨려보고, 통과한 것만 다음으로 넘긴다.
+```bash
+python scripts/run_tests.py
+```
 
-| 스위트 | 항목 수 | 무엇을 잡는가 |
+**9개 스위트 157항목 전부 통과.**
+
+| 스위트 | 항목 | 무엇을 잡는가 |
 |---|---|---|
 | `verify_env.py` | 9 | GPU 행렬곱 정확도, 정밀도 실측 TFLOPS, GQA SDPA, 가용 VRAM |
 | `test_tokenizer.py` | 13 | 적대적 입력 28종, 무작위 유니코드 1000건, 어휘 크기 불변 |
@@ -230,56 +268,139 @@ result = run_with_search(
 | `test_sft.py` | 23 | 손실 마스킹 경계, 어휘 불변, 평가가 에포크를 갉아먹는지 |
 | `test_tools.py` | 48 | 파서 경계, 검색 오류 구분, 마커 위조, 컨텍스트 예산 |
 | `test_regress_correctness.py` | 7 | 적대적 검증에서 재현된 결함 7종의 회귀 고정 |
+| `test_watchdog.py` | 19 | 좀비 판정, 조기사망 차단, 정상 종료 인식, 재시작 인자 일치 |
 
-특히 **인과 마스크 누설**은 손실 곡선만 봐서는 절대 못 잡는다. 뚫려
-있으면 손실은 예쁘게 떨어지지만 생성은 전혀 안 된다.
+테스트의 목적은 "동작하는지" 확인이 아니라 **"어떻게 깨지는지" 찾는 것**이다.
 
-**정밀도**도 같은 종류다. 학습 dtype은 GPU 세대가 정한다 — Ampere(sm_80)
-이상은 bf16, V100(sm_70)급은 fp16이다. `torch.cuda.is_bf16_supported()`는
-V100에서도 True를 반환하지만 그 bf16은 에뮬레이션이라 fp32보다도 느리다
-(실측 bf16 10.0 / fp32 13.2 / fp16 88.8 TFLOPS). 그래서 `verify_env.py`는
-지원 여부가 아니라 **실측 TFLOPS가 fp32보다 빠른지**를 판정 근거로 쓴다.
-근거는 `model/precision.py`에 적어뒀다.
+특히 **인과 마스크 누설**은 손실 곡선만 봐서는 절대 못 잡는다. 뚫려 있으면
+손실은 예쁘게 떨어지고 생성만 안 된다. 재개 궤적도 마찬가지다 — 재개 전후
+손실 차이가 0.00e+00임을 테스트로 고정해 뒀다.
 
-## 실측치 (RTX 4050 Laptop 6GB)
+## 체크포인트
 
-| 항목 | 값 |
-|---|---|
-| 데이터 | codeparrot-clean 8샤드 → 419,773 문서 / 3.63GB (유지율 52.5%) |
-| 토큰 | train 1,027,146,559 / val 2,103,160 |
-| 토크나이저 | 병합 16,127개, 압축률 3.763 바이트/토큰 |
-| 배치 | batch 4 × 누적 32 = 131,072 토큰/스텝 (peak VRAM 4.45GB) |
-| 처리량 | 5,601 tok/s |
-| 1에포크 | 7,800스텝 ≈ **51시간** |
+git에 없다. 학습 결과물이고 개당 3.4 GB다.
 
-### VRAM 주의사항
+| 파일 | 크기 | 용도 |
+|---|---|---|
+| `best.pt` | 3.39 GB | 검증 손실 최저 지점. 가중치 + AdamW 상태 + 스텝 |
+| `latest.pt` | 3.39 GB | 마지막 지점. `--resume`이 읽는다 |
+| `sangyong_llm_282m_iter13120.pt` | 1.13 GB | 추론 전용 가중치 |
+| `trainlog.jsonl` | 157 KB | 스텝별 손실·lr·기울기 노름 (**git에 있다**) |
+| `train_stdout.log` | 113 KB | 학습 표준출력 전문 (**git에 있다**) |
+| `watchdog.log` | 2.3 KB | 워치독 재시작 기록 (**git에 있다**) |
 
-Windows(WDDM)는 VRAM이 모자라도 **OOM을 내지 않는다.** 드라이버가 조용히
-시스템 RAM으로 흘려보내서 "돌긴 도는데 20배 느린" 상태가 된다.
-`scripts/probe_vram.py`가 이걸 잡아준다.
+체크포인트의 3분의 2는 AdamW의 `exp_avg` / `exp_avg_sq`다. 학습을 이어서
+하려면 필요하지만 추론에는 쓸모가 없다. 떼어내면 3분의 1로 줄어든다.
 
 ```bash
-.venv/Scripts/python.exe scripts/probe_vram.py
+python scripts/export_weights.py --ckpt checkpoints/best.pt          # 3.4GB -> 1.1GB
+python scripts/export_weights.py --ckpt checkpoints/best.pt --half   # 1.1GB -> 0.6GB
 ```
 
-| batch | peak | 초/스텝 | 판정 |
-|---|---|---|---|
-| 2 | 2.59GB | 0.818 | OK |
-| 4 | 4.45GB | 1.585 | OK (최적) |
-| 6 | 6.30GB | - | 안전선 초과 → 시스템 RAM 유출 |
+`--half`로 만든 파일로는 학습을 이어서 할 수 없다.
+
+그래프를 다시 그리려면 (`matplotlib`은 문서용이고 학습·추론 의존성이 아니다):
+
+```bash
+uv pip install matplotlib
+python scripts/plot_training.py --font NotoSansKR-Regular.ttf NotoSansKR-Bold.ttf
+```
+
+## 재현
+
+Python 3.12 venv + PyTorch cu124. Python 3.14에는 CUDA 휠이 없다.
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install torch numpy pyarrow huggingface_hub --index-url https://download.pytorch.org/whl/cu124
+```
+
+전체 검증부터 돌린다. 통과하지 않으면 다음으로 넘어가지 않는다.
+
+```bash
+.venv/bin/python scripts/run_tests.py
+```
+
+데이터를 준비한다. 54샤드면 약 6.9B 토큰이다. `filter`는 이미 처리한 샤드를
+건너뛰므로 나눠서 받아도 된다.
+
+```bash
+.venv/bin/python data/download.py --shards 54
+.venv/bin/python data/prepare.py filter
+.venv/bin/python data/prepare.py tokenize
+```
+
+토크나이저는 **다시 학습하지 않는다.** `tokenizer/tokenizer.json`이 저장소에
+들어 있고, 이걸 바꾸면 어휘 크기가 달라져 체크포인트가 전부 무용지물이 된다.
+
+며칠 걸리는 작업이므로 터미널·세션과 분리해서, 워치독을 통해 띄운다.
+
+```bash
+.venv/bin/python scripts/train_watchdog.py start --model 282m --batch-size 2 --grad-accum 128
+.venv/bin/python scripts/train_watchdog.py status
+.venv/bin/python scripts/train_detached.py stop     # 워치독 먼저, 그다음 학습
+```
+
+`stop`의 순서가 반대면 워치독이 방금 멈춘 학습을 되살린다.
+
+## 아직 안 한 것
+
+- **SFT를 안 돌렸다.** 기반 모델은 이제 나왔다(`checkpoints/best.pt`).
+  데이터셋 2,845/155쌍과 학습 루프는 준비됐고 CPU 초소형 모델로만 검증한
+  상태다. 위의 생성 예시가 보여주듯 "멈추는 법"을 가르치는 게 다음 순서다.
+- **검증 배치 시드를 안 박았다.** 손실 곡선의 되튐이 이것 때문이다.
+  SFT 전에 고쳐야 비교가 가능하다.
+- **검색/툴 레이어는 실제 키로 안 돌렸다.** 파서와 파이프라인은 48항목으로
+  검증했지만 실제 검색은 `BRAVE_SEARCH_API_KEY` 등이 있어야 나간다.
 
 ## 한계
 
-- **6GB VRAM이 상한이다.** 1B 파라미터는 안 들어가고, 들어간다 해도 약
-  9개월 걸린다. Claude Opus 5급(학습비 $200M~500M)은 범위 밖이다.
-- GPU를 다른 작업과 공유하면 클럭이 3105MHz에서 645MHz까지 떨어지고
-  처리량이 절반 이하가 된다. 학습 전에 `nvidia-smi`로 확인할 것.
+- **1에포크로 끝났다.** 검증 손실이 아직 내려가는 중이었다. 수렴이 아니라
+  데이터 소진이다.
+- **의미 정확도가 낮다.** 문법 96%에 pass@5 60%, 샘플 단위로는 26%다.
+  282M에 6.9B 토큰이면 여기까지다.
+- GPU 한 장만 썼다. 서버에 V100S가 9장 있지만 DDP를 붙이지 않았다.
+  붙였으면 12.5일이 아니라 2일이면 끝났을 일이다.
 - 평가 격리는 별도 프로세스 + 타임아웃 수준이다. 컨테이너나 seccomp를 쓴
   진짜 샌드박스는 아니다.
-- **SFT는 아직 한 번도 못 돌렸다.** 기반 모델(`checkpoints/best.pt`)이
-  프리트레이닝 중이라 없다. 코드와 데이터셋은 준비됐고 CPU 초소형 모델로만
-  검증한 상태다.
-- 검색은 API 키가 있어야 실제로 나간다. 키 없이 돌아가는 것은 테스트뿐이다.
-- 툴 호출 마커는 한국어라 이 토크나이저에서 9~15토큰을 먹는다. 같은 뜻의
+- 툴 호출 마커가 한국어라 이 토크나이저에서 9~15토큰을 먹는다. 같은 뜻의
   ASCII 마커는 4~5토큰이다. SFT 시작 전이면 바꾸는 편이 컨텍스트 예산에
-  유리하다(`tools/protocol.py` 상수 세 줄).
+  유리하다 (`tools/protocol.py` 상수 세 줄).
+
+## 저장소
+
+| 경로 | 역할 |
+|---|---|
+| `tokenizer/bpe.py` | 바이트 단위 BPE. 학습/인코딩/디코딩/저장 |
+| `model/transformer.py` | RoPE, RMSNorm, GQA 어텐션, SwiGLU, KV 캐시 생성 |
+| `model/precision.py` | GPU 세대로 bf16/fp16 선택. `is_bf16_supported()`를 안 믿는다 |
+| `data/download.py` | codeparrot-clean 샤드 다운로드 |
+| `data/prepare.py` | 필터 → 토크나이저 학습 → 토큰화 (3단계) |
+| `train/train.py` | 프리트레이닝 루프 (기울기 누적, 체크포인트, 재개) |
+| `train/sample.py` | 학습된 모델로 코드 생성 |
+| `eval/harness.py` | 문법 유효율 + pass@k 채점 |
+| `eval/problems.py` | 채점 문제 10종 |
+| `finetune/make_dataset.py` | 코퍼스에서 (독스트링 → 함수) 지시-응답 쌍 추출 |
+| `finetune/format.py` | `### 지시:` / `### 코드:` 프롬프트 포맷 |
+| `finetune/dataset.py` | SFT 데이터셋. 프롬프트 구간 손실 마스킹 |
+| `finetune/sft.py` | 인스트럭션 튜닝 루프 (프리트레이닝 lr의 1/10) |
+| `tools/protocol.py` | `### 검색:` 툴 호출 파싱, 검색 결과 컨텍스트 포맷 |
+| `tools/search.py` | Brave / Tavily / Serper 클라이언트 |
+| `tools/pipeline.py` | 생성 → 툴 호출 → 검색 → 재주입 루프 |
+| `scripts/verify_env.py` | GPU/CUDA 환경 검증 |
+| `scripts/probe_vram.py` | 안전한 batch_size 실측 |
+| `scripts/train_detached.py` | 학습을 세션과 분리해 실행 / 상태 / 중단 |
+| `scripts/train_watchdog.py` | 죽거나 멈춘 학습을 다시 띄운다 |
+| `scripts/export_weights.py` | 체크포인트에서 추론 가중치만 추출 |
+| `scripts/plot_training.py` | 학습 로그로 README 그래프 생성 |
+| `scripts/run_tests.py` | 9개 스위트 일괄 실행 |
+
+설계 근거와 시행착오는
+[docs/design/2026-08-13-sangyong-llm-design.md](docs/design/2026-08-13-sangyong-llm-design.md),
+서버 구성은 [docs/SERVER_SETUP.md](docs/SERVER_SETUP.md),
+작업 규칙은 [CLAUDE.md](CLAUDE.md)에 있다.
+
+## 라이선스
+
+MIT. 학습 데이터는 `codeparrot/codeparrot-clean`에서 허용 라이선스 문서만
+걸러 썼다.
