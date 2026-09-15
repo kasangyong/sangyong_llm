@@ -74,29 +74,40 @@ def _read_pid() -> int | None:
         return None
 
 
-def cmd_start(args):
-    pid = _read_pid()
-    if pid and _alive(pid):
-        raise SystemExit(f"이미 돌고 있다 (PID {pid}). 먼저 stop 할 것.")
-
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(PYTHON), "-u", str(ROOT / "train" / "train.py")]
+def build_train_args(args) -> list[str]:
+    """네임스페이스를 train.py 인자 목록으로 바꾼다. 워치독이 재시작할 때
+    같은 인자를 그대로 다시 쓰려면 이 변환이 한 군데에 있어야 한다."""
+    out = []
     if args.resume:
-        cmd.append("--resume")
+        out.append("--resume")
     if args.model:
-        cmd += ["--model", args.model]
+        out += ["--model", args.model]
     if args.precision:
-        cmd += ["--precision", args.precision]
-    if args.epochs is not None:
-        cmd += ["--epochs", str(args.epochs)]
+        out += ["--precision", args.precision]
+    if getattr(args, "epochs", None) is not None:
+        out += ["--epochs", str(args.epochs)]
     if args.batch_size:
-        cmd += ["--batch-size", str(args.batch_size)]
+        out += ["--batch-size", str(args.batch_size)]
     if args.grad_accum:
-        cmd += ["--grad-accum", str(args.grad_accum)]
+        out += ["--grad-accum", str(args.grad_accum)]
+    return out
+
+
+def launch(train_args: list[str], python: Path = PYTHON, root: Path = ROOT,
+           ckpt_dir: Path = CKPT_DIR, log_file: Path = LOG_FILE,
+           pid_file: Path = PID_FILE) -> int:
+    """학습을 세션에서 떼어내 띄우고 PID를 돌려준다.
+
+    워치독과 수동 실행이 같은 경로를 쓰도록 여기 하나로 모은다. 런처가 둘이면
+    인자나 PID 파일이 어긋나서, 워치독이 자기가 안 띄운 프로세스를 감시하거나
+    이미 도는 학습 위에 하나를 더 얹는 사고가 난다.
+    """
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [str(python), "-u", str(root / "train" / "train.py"), *train_args]
 
     env = {**os.environ, "PYTHONUTF8": "1"}
     # append 모드로 열어 재개 시 이전 로그를 지우지 않는다
-    log = open(LOG_FILE, "a", encoding="utf-8", errors="replace")
+    log = open(log_file, "a", encoding="utf-8", errors="replace")
     log.write(f"\n{'=' * 60}\n[detached] 시작 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     log.write(f"[detached] {' '.join(cmd)}\n{'=' * 60}\n")
     log.flush()
@@ -113,7 +124,7 @@ def cmd_start(args):
         extra = {"start_new_session": True}
     proc = subprocess.Popen(
         cmd,
-        cwd=str(ROOT),
+        cwd=str(root),
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -121,8 +132,20 @@ def cmd_start(args):
         close_fds=True,
         **extra,
     )
-    PID_FILE.write_text(str(proc.pid))
-    print(f"분리 실행 시작: PID {proc.pid}")
+    # 자식이 fd를 복제해 갔으니 이쪽 사본은 닫는다. 워치독처럼 이 함수를
+    # 여러 번 부르는 쪽에서는 안 닫으면 재시작마다 fd가 하나씩 샌다.
+    log.close()
+    pid_file.write_text(str(proc.pid))
+    return proc.pid
+
+
+def cmd_start(args):
+    pid = _read_pid()
+    if pid and _alive(pid):
+        raise SystemExit(f"이미 돌고 있다 (PID {pid}). 먼저 stop 할 것.")
+
+    new_pid = launch(build_train_args(args))
+    print(f"분리 실행 시작: PID {new_pid}")
     print(f"로그: {LOG_FILE}")
     print(f"상태 확인: {PYTHON.name} scripts/train_detached.py status")
 
