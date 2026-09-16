@@ -430,7 +430,9 @@ uv pip install torch numpy pyarrow huggingface_hub --index-url https://download.
   282M에 6.9B 토큰이면 여기까지다.
 - GPU 한 장만 썼다. 서버에 V100S가 10장 있지만 3번 한 장만 쓰기로 약속한
   공용 장비다(`~/.profile`의 `CUDA_VISIBLE_DEVICES=3`로 강제). DDP를 붙일
-  자리가 아니라 12.5일이 걸렸다.
+  자리가 아니라 12.5일이 걸렸다. DDP 코드 자체는 `ddp-l40s` 브랜치에 있는데,
+  L40S 3장을 전제로 짰고 bf16이 코드에 박혀 있어 이 V100S에서는 쓸 수 없다.
+  실제 하드웨어에서 돌려본 적도 없다.
 - 평가 격리는 별도 프로세스 + 타임아웃 수준이다. 컨테이너나 seccomp를 쓴
   진짜 샌드박스는 아니다.
 - 툴 호출 마커가 한국어라 이 토크나이저에서 9~15토큰을 먹는다. 같은 뜻의
