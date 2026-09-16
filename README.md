@@ -72,10 +72,26 @@ context      2048                         1024
 기준 HW      V100S 32GB                   RTX 4050 Laptop 6GB
 ```
 
-- **위치 인코딩**: RoPE. 학습 가능한 위치 임베딩이 없다.
-- **정규화**: RMSNorm (pre-norm). LayerNorm의 평균 빼기를 생략한다.
-- **어텐션**: GQA. 282m은 Q 16헤드에 KV 4헤드를 공유해 KV 캐시를 1/4로 줄인다.
-- **FFN**: SwiGLU. `w_down(silu(w_gate(x)) * w_up(x))`, bias 없음.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.png">
+  <img alt="모델 구조도" src="docs/assets/architecture-light.png">
+</picture>
+
+- **위치 인코딩**: RoPE. 학습 가능한 위치 임베딩이 없다. q와 k를 위치에 따라
+  회전시키면 두 벡터의 내적에 **상대 거리**가 자연히 들어간다. 위치마다
+  파라미터를 두지 않으므로 학습할 것이 없고, 학습 때 본 적 없는 길이에도
+  정의는 된다(잘 동작한다는 보장은 별개다).
+- **정규화**: RMSNorm (pre-norm). LayerNorm과 달리 평균을 빼지 않고 제곱평균
+  제곱근으로만 나눈다. pre-norm이라 잔차 경로가 항등 함수로 남아, 24층을
+  쌓아도 초기 신호가 감쇠하지 않는다.
+- **어텐션**: GQA. Q 16헤드가 KV 4헤드를 4:1로 공유한다. head_dim은
+  1024/16 = 64다. 2,048토큰 한 줄을 생성할 때 KV 캐시가 fp16 기준
+  **48 MB** — 같은 크기를 MHA로 짰다면 192 MB다.
+- **FFN**: SwiGLU. `w_down(silu(w_gate(x)) * w_up(x))`, bias 없음. 게이트
+  때문에 행렬이 2개가 아니라 3개다. `d_ff` 2,752는 임의로 고른 값이 아니라
+  `4 × d_model`에 2/3를 곱해 행렬 3개의 파라미터를 2개일 때와 맞추고
+  (4096 × 2/3 ≈ 2731) 64의 배수로 올린 값이다. 53m의 1,728도 같은 규칙에서
+  나온다(2560 × 2/3 ≈ 1707 → 1728).
 - **어휘**: 16,384 — 프리셋이 정하지 않고 항상 `tokenizer/tokenizer.json`에서
   읽는다. 어휘가 바뀌면 임베딩 크기가 달라져 기존 체크포인트가 전부
   무용지물이 되기 때문이다.
@@ -83,19 +99,46 @@ context      2048                         1024
 `282m`의 크기는 취향이 아니라 계산이다. 6.88B 토큰의 Chinchilla 최적치가
 약 330M이고, 같은 데이터를 53M에 쓰면 6배 과잉이라 수익이 크게 체감된다.
 
+### 282.6M이 어디에 있나
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/params-dark.png">
+  <img alt="파라미터 구성" src="docs/assets/params-light.png">
+</picture>
+
+파라미터를 셀 때 흔히 어텐션을 먼저 떠올리지만, 실제로 무거운 쪽은 **FFN이고
+전체의 71.8%**다. 레이어 1장만 보면 더 뚜렷해서 FFN 8.45M 대 어텐션 2.62M,
+76% 대 24%다. 게이트가 붙어 행렬이 3개인 데다 각 행렬이 1024 × 2752이기
+때문이다.
+
+어텐션이 22.3%로 내려앉은 것은 GQA 덕이다. K와 V를 16헤드가 아니라 4헤드로만
+두므로 두 행렬이 1024 × 1024가 아니라 1024 × 256이다. 같은 모델을 MHA로 짰다면
+레이어마다 1.57M씩, 전체로 **37.7M이 더 붙는다.** GQA는 KV 캐시를 줄이려고
+넣은 것인데 파라미터도 같이 줄었다.
+
+임베딩이 5.9%뿐인 것은 어휘가 16,384로 작고 `lm_head`가 임베딩과 **같은
+텐서를 쓰기** 때문이다(`tie_embeddings`). 묶지 않았다면 16.8M이 더 붙는다.
+RMSNorm은 50,176개로 전체의 0.02%라 그림에서 보이지도 않는다.
+
+이 수치는 옮겨 적은 것이 아니라 `model.Transformer`를 실제로 만들어 센 값이고,
+합이 282,641,408로 위 표와 맞는다.
+
 ## 데이터
 
 `codeparrot/codeparrot-clean` 54샤드(12.2 GB 압축)에서 출발한다.
 
-```
-원본 문서    5,361,373
-  라이선스 탈락  -2,020,123     비허용/불명 라이선스
-  문법 탈락        -466,624     ast.parse 실패
-  크기 탈락          -6,287     너무 짧거나 너무 긺
-중복 제거             -0        해시 기준 중복 없음
-──────────────────────────
-유지         2,868,339 (53.5%) / 24.24 GB
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/data-funnel-dark.png">
+  <img alt="문서 필터 깔때기" src="docs/assets/data-funnel-light.png">
+</picture>
+
+문법으로 떨어진 46만 건은 `ast.parse`가 실패한 것들이다. 파이썬 2 문법과
+잘린 파일이 여기 들어간다. 크기 탈락 6,287건은 전체의 0.1%라 그림에서 선
+하나로 보인다.
+
+중복 제거가 **0건**인 것은 파이프라인이 안 돈 게 아니라 `codeparrot-clean`이
+이미 해시 중복을 걷어낸 데이터셋이기 때문이다. 그래도 단계를 남겨 둔 것은
+다른 코퍼스를 붙일 때 필요하기 때문이다.
 
 토큰화하면 **train 6,879,527,547 / val 13,756,746 토큰**이다
 (`train.bin` 13.1 GB, `val.bin` 26.2 MB, uint16 평면 배열).
@@ -137,11 +180,10 @@ python scripts/train_watchdog.py start --model 282m --batch-size 2 --grad-accum 
 `torch.cuda.is_bf16_supported()`는 V100에서도 `True`를 반환한다. 그 bf16은
 텐서코어가 아니라 에뮬레이션이라 fp32보다도 느리다.
 
-| 정밀도 | 실측 TFLOPS |
-|---|---|
-| bf16 | 10.0 |
-| fp32 | 13.2 |
-| **fp16** | **88.8** |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/precision-dark.png">
+  <img alt="정밀도별 실측 TFLOPS" src="docs/assets/precision-light.png">
+</picture>
 
 그래서 `scripts/verify_env.py`는 "지원하는가"가 아니라 **"실측 TFLOPS가
 fp32보다 빠른가"**를 판정 근거로 쓴다. 지원 여부만 믿었다면 8.9배 느리게
@@ -203,18 +245,15 @@ python eval/harness.py --ckpt checkpoints/best.pt --k 5
 | pass@5 | **60.0%** (6/10) |
 | 샘플 단위 통과율 | 26.0% (13/50) |
 
-| 문제 | pass@5 | 5회 결과 |
-|---|---|---|
-| `add_two` | 통과 | assert, **pass**, syntax, **pass**, **pass** |
-| `is_even` | 통과 | **pass**, assert, **pass**, **pass**, **pass** |
-| `reverse_string` | 실패 | assert, syntax, assert, assert, assert |
-| `max_of_list` | 통과 | error, **pass**, error, error, error |
-| `count_vowels` | 통과 | assert, error, assert, **pass**, error |
-| `fizzbuzz` | 실패 | assert, assert, assert, error, assert |
-| `sum_list` | 통과 | assert, error, error, **pass**, error |
-| `unique_sorted` | 실패 | error, error, error, timeout, assert |
-| `factorial` | 실패 | timeout, assert, error, assert, assert |
-| `word_count` | 통과 | **pass**, error, **pass**, assert, **pass** |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/eval-grid-dark.png">
+  <img alt="문제 10개 × 5회 생성 결과 격자" src="docs/assets/eval-grid-light.png">
+</picture>
+
+칸 하나가 생성 한 번이다. 통과는 **50칸 중 13칸**뿐인데 pass@5는 60%가 된다 —
+5번 중 한 번만 맞으면 그 문제는 통과로 세기 때문이다. `max_of_list`는 5번 중
+4번이 실행 오류인데 통과로 잡혔고, `sum_list`도 마찬가지다. **pass@5는 모델이
+얼마나 자주 맞히는지가 아니라 몇 번 시켜보면 한 번은 맞히는지를 재는 값**이다.
 
 50회 중 실패 사유: 단언 불일치 18, 실행 오류 15, 문법 오류 2, 타임아웃 2.
 
