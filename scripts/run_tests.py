@@ -17,6 +17,7 @@ SUITES = [
     ("검색/툴 레이어", ROOT / "tests" / "test_tools.py"),
     ("적대적 회귀", ROOT / "tests" / "test_regress_correctness.py"),
     ("학습 워치독", ROOT / "tests" / "test_watchdog.py"),
+    ("추론용 내보내기", ROOT / "tests" / "test_export.py"),
 ]
 
 

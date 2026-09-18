@@ -29,6 +29,39 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _view_key(t):
+    """같은 저장소를 같은 방식으로 보는 텐서끼리 묶는 키."""
+    return (
+        t.untyped_storage().data_ptr(),
+        tuple(t.shape),
+        tuple(t.stride()),
+        t.storage_offset(),
+    )
+
+
+def cast_state(state: dict, half: bool) -> dict:
+    """내보낼 state_dict를 만든다. half면 2차원 이상만 bf16으로 내린다.
+
+    정규화 가중치(1차원)까지 내리면 수치가 불안정해질 수 있어 남긴다.
+
+    변환할 때 텐서를 키마다 따로 만들면 안 된다. `.to()`가 새 저장소를 잡아서
+    입출력 임베딩의 공유가 끊기고, 같은 값이 파일에 두 번 들어간다. 실측(53M):
+    102MB로 끝날 파일이 122MB가 된다 — 임베딩 10,485,760개 x 2바이트 =
+    20MB가 통째로 중복이다. 282M이면 34MB다. 정확도에는 영향이 없어서
+    파일 크기를 재보기 전에는 드러나지 않는다.
+    """
+    if not half:
+        return state
+    cache: dict = {}
+    out: dict = {}
+    for k, v in state.items():  # 원래 키 순서를 유지한다
+        vk = _view_key(v)
+        if vk not in cache:
+            cache[vk] = v.to(torch.bfloat16) if v.dim() >= 2 else v
+        out[k] = cache[vk]
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=str(ROOT / "checkpoints" / "best.pt"))
@@ -45,12 +78,7 @@ def main():
         if key not in ck:
             raise SystemExit(f"체크포인트에 '{key}'가 없다. 형식이 다르다.")
 
-    state = ck["model"]
-    if args.half:
-        # 정규화 가중치까지 내리면 수치가 불안정해질 수 있어 2차원 이상만 내린다.
-        state = {
-            k: (v.to(torch.bfloat16) if v.dim() >= 2 else v) for k, v in state.items()
-        }
+    state = cast_state(ck["model"], args.half)
 
     payload = {
         "model": state,
